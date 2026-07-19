@@ -1,0 +1,5 @@
+// Windows resource script: declares the app icon as resource ID 1.
+// Referenced from build.rs, and loaded at runtime via
+// LoadIconW(hinstance, MAKEINTRESOURCEW(1)) in windows_app.rs.
+
+1 ICON "assets/icon.ico"
