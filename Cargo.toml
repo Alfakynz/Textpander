@@ -26,6 +26,8 @@ features = [
     "synchapi",
     "errhandlingapi",
     "winerror",
+    "winreg",
+    "winnt",
 ]
 
 [profile.release]

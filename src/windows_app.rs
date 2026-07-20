@@ -16,7 +16,7 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use winapi::shared::minwindef::{HINSTANCE, LPARAM, LRESULT, UINT, WPARAM};
+use winapi::shared::minwindef::{HINSTANCE, HKEY, LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HHOOK, HICON, HWND, POINT};
 use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
 use winapi::um::errhandlingapi::GetLastError;
@@ -26,6 +26,10 @@ use winapi::um::shellapi::{
     NOTIFYICONDATAW,
 };
 use winapi::um::synchapi::CreateMutexW;
+use winapi::um::winnt::{KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ};
+use winapi::um::winreg::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY_CURRENT_USER,
+};
 use winapi::um::winuser::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, FindWindowW, GetAsyncKeyState, GetCursorPos, GetForegroundWindow,
@@ -34,11 +38,12 @@ use winapi::um::winuser::{
     SetForegroundWindow, SetWindowsHookExW, ToUnicodeEx, TrackPopupMenu, TranslateMessage,
     UnhookWindowsHookEx, HC_ACTION, IDI_APPLICATION, IMAGE_ICON, INPUT, INPUT_KEYBOARD,
     KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LLKHF_INJECTED,
-    LR_DEFAULTSIZE, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RIGHTBUTTON, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
-    VK_SPACE, VK_TAB, WH_KEYBOARD_LL, WM_APP, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+    LR_DEFAULTSIZE, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SM_CXSMICON,
+    SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, VK_BACK, VK_CAPITAL,
+    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, WH_KEYBOARD_LL, WM_APP, WM_COMMAND,
+    WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WNDCLASSW,
 };
 
 const WM_TRAYICON: UINT = WM_APP + 1;
@@ -48,6 +53,7 @@ const ID_EXIT: usize = 1003;
 const ID_TOGGLE_ENABLED: usize = 1004;
 const ID_HIDE_TRAY: usize = 1005;
 const ID_OPEN_SETTINGS: usize = 1006;
+const ID_TOGGLE_STARTUP: usize = 1007;
 const TRAY_ID: u32 = 1;
 const MAX_BUFFER_LEN: usize = 64;
 
@@ -98,8 +104,12 @@ struct AppState {
     enabled: bool,
     /// Whether the tray icon is currently shown. Purely informational for
     /// the menu label; the actual add/remove happens via show_tray_icon /
-    /// hide_tray_icon.
+    /// hide_tray_icon. Persisted to config.json as `show_tray_icon`.
     tray_visible: bool,
+    /// Whether Textpander is registered to launch when the user logs in.
+    /// Kept in sync with the HKCU Run registry key and persisted to
+    /// config.json as `start_on_login`.
+    start_on_login: bool,
 }
 
 static STATE: Mutex<Option<AppState>> = Mutex::new(None);
@@ -235,6 +245,14 @@ struct AppSettings {
     /// tray "Enable/Disable replacements" toggle.
     #[serde(default = "default_true")]
     enabled: bool,
+    /// Whether the tray icon is shown on startup. Kept in sync with the
+    /// tray "Hide tray" action (and relaunching the exe to bring it back).
+    #[serde(default = "default_true")]
+    show_tray_icon: bool,
+    /// Whether Textpander launches automatically when the user logs in.
+    /// Kept in sync with the tray "Start on login" toggle.
+    #[serde(default)]
+    start_on_login: bool,
 }
 
 fn default_true() -> bool {
@@ -243,11 +261,15 @@ fn default_true() -> bool {
 
 impl Default for AppSettings {
     fn default() -> Self {
-        AppSettings { enabled: true }
+        AppSettings {
+            enabled: true,
+            show_tray_icon: true,
+            start_on_login: false,
+        }
     }
 }
 
-const DEFAULT_SETTINGS: &str = "{\n    \"enabled\": true\n}\n";
+const DEFAULT_SETTINGS: &str = "{\n    \"enabled\": true,\n    \"show_tray_icon\": true,\n    \"start_on_login\": false\n}\n";
 
 fn ensure_settings_exists(path: &PathBuf) {
     if !path.exists() {
@@ -278,6 +300,68 @@ fn load_settings(path: &PathBuf) -> AppSettings {
 fn save_settings(path: &PathBuf, settings: &AppSettings) {
     if let Ok(text) = serde_json::to_string_pretty(settings) {
         let _ = fs::write(path, text);
+    }
+}
+
+/// Rebuilds the full AppSettings from the live AppState and writes it out.
+/// Used whenever any individual persisted setting changes, so we never
+/// clobber the other fields with stale/default values.
+fn persist_settings(state: &AppState) {
+    let settings = AppSettings {
+        enabled: state.enabled,
+        show_tray_icon: state.tray_visible,
+        start_on_login: state.start_on_login,
+    };
+    save_settings(&state.settings_path, &settings);
+}
+
+/// Adds or removes the HKCU ...\Run value that makes Windows launch
+/// Textpander automatically at login. Best-effort: failures (e.g. no
+/// permission, though HKCU normally doesn't need any) are silently
+/// ignored rather than shown as a message box, since this isn't critical
+/// to the app's core function.
+fn set_start_on_login(enabled: bool) {
+    unsafe {
+        let subkey = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let mut hkey: HKEY = null_mut();
+        let status = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            null_mut(),
+            &mut hkey,
+            null_mut(),
+        );
+        if status != 0 || hkey.is_null() {
+            return;
+        }
+
+        let value_name = to_wide(APP_UNIQUE_NAME);
+        if enabled {
+            if let Ok(exe_path) = env::current_exe() {
+                // Quoted so the launch command stays correct even if the
+                // install path contains spaces.
+                let quoted = format!("\"{}\"", exe_path.to_string_lossy());
+                let data = to_wide(&quoted);
+                let data_len_bytes = (data.len() * size_of::<u16>()) as u32;
+                RegSetValueExW(
+                    hkey,
+                    value_name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    data.as_ptr() as *const u8,
+                    data_len_bytes,
+                );
+            }
+        } else {
+            // Fine if the value doesn't exist yet - just a no-op.
+            RegDeleteValueW(hkey, value_name.as_ptr());
+        }
+
+        RegCloseKey(hkey);
     }
 }
 
@@ -372,6 +456,11 @@ pub fn run() {
         let config = load_replacements(&replacements_path);
         let settings = load_settings(&settings_path);
 
+        // Keep the registry in sync with the persisted preference, in case
+        // it was changed by hand in config.json or the Run key was cleared
+        // by something else since the last launch.
+        set_start_on_login(settings.start_on_login);
+
         *STATE.lock().unwrap() = Some(AppState {
             config,
             replacements_path,
@@ -382,14 +471,17 @@ pub fn run() {
             suppress_next_keyup: None,
             pending_word: None,
             enabled: settings.enabled,
-            tray_visible: true,
+            tray_visible: settings.show_tray_icon,
+            start_on_login: settings.start_on_login,
         });
 
         *TRAY.lock().unwrap() = Some(TrayResources {
             hwnd,
             icon: small_icon,
         });
-        show_tray_icon();
+        if settings.show_tray_icon {
+            show_tray_icon();
+        }
 
         // Global low-level keyboard hook. Must run on a thread with an
         // active message loop, which is exactly what we run below.
@@ -404,7 +496,7 @@ pub fn run() {
         if !hook.is_null() {
             UnhookWindowsHookEx(hook);
         }
-        hide_tray_icon();
+        remove_tray_icon_visual();
     }
 }
 
@@ -441,6 +533,9 @@ unsafe extern "system" fn wndproc(
                 ID_OPEN_SETTINGS => {
                     open_settings();
                 }
+                ID_TOGGLE_STARTUP => {
+                    toggle_start_on_login();
+                }
                 ID_TOGGLE_ENABLED => {
                     toggle_enabled();
                 }
@@ -463,11 +558,11 @@ unsafe extern "system" fn wndproc(
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
-    let (enabled, _tray_visible) = {
+    let (enabled, _tray_visible, start_on_login) = {
         let guard = STATE.lock().unwrap();
         match guard.as_ref() {
-            Some(s) => (s.enabled, s.tray_visible),
-            None => (true, true),
+            Some(s) => (s.enabled, s.tray_visible, s.start_on_login),
+            None => (true, true, false),
         }
     };
 
@@ -480,6 +575,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     };
     let toggle_label = to_wide(toggle_text);
     let hide_label = to_wide("Hide tray");
+    let startup_label = to_wide("Start on login");
     let reload_label = to_wide("Reload replacements");
     let open_label = to_wide("Open replacements.json");
     let open_settings_label = to_wide("Open settings (config.json)");
@@ -487,6 +583,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 
     AppendMenuW(menu, MF_STRING, ID_TOGGLE_ENABLED, toggle_label.as_ptr());
     AppendMenuW(menu, MF_STRING, ID_HIDE_TRAY, hide_label.as_ptr());
+    let startup_flags = MF_STRING | if start_on_login { MF_CHECKED } else { MF_UNCHECKED };
+    AppendMenuW(menu, startup_flags, ID_TOGGLE_STARTUP, startup_label.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
     AppendMenuW(menu, MF_STRING, ID_RELOAD, reload_label.as_ptr());
     AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, open_label.as_ptr());
@@ -540,14 +638,15 @@ fn show_tray_icon() {
     drop(tray_guard);
     if let Some(state) = STATE.lock().unwrap().as_mut() {
         state.tray_visible = true;
+        persist_settings(state);
     }
 }
 
-/// Removes the tray icon. The app keeps running in the background (hook
-/// and replacements still active) - only the visible icon goes away. Can
-/// be brought back by relaunching the exe (see the single-instance /
-/// WAKE_MSG handling in run() and wndproc).
-fn hide_tray_icon() {
+/// Removes the tray icon's visual presence only - no state/settings
+/// changes. Used both by the user-facing hide_tray_icon() below and by
+/// run()'s shutdown cleanup (which must NOT persist "hidden" just because
+/// the process is exiting).
+fn remove_tray_icon_visual() {
     let tray_guard = TRAY.lock().unwrap();
     if let Some(tray) = tray_guard.as_ref() {
         unsafe {
@@ -558,9 +657,19 @@ fn hide_tray_icon() {
             Shell_NotifyIconW(NIM_DELETE, &mut nid);
         }
     }
-    drop(tray_guard);
+}
+
+/// Removes the tray icon in response to the user's "Hide tray" menu
+/// action. The app keeps running in the background (hook and
+/// replacements still active) - only the visible icon goes away. Can be
+/// brought back by relaunching the exe (see the single-instance /
+/// WAKE_MSG handling in run() and wndproc), which also persists it as
+/// visible again.
+fn hide_tray_icon() {
+    remove_tray_icon_visual();
     if let Some(state) = STATE.lock().unwrap().as_mut() {
         state.tray_visible = false;
+        persist_settings(state);
     }
 }
 
@@ -574,12 +683,16 @@ fn toggle_enabled() {
         state.last_expansion = None;
         state.suppress_expansion = false;
         state.pending_word = None;
-        save_settings(
-            &state.settings_path,
-            &AppSettings {
-                enabled: state.enabled,
-            },
-        );
+        persist_settings(state);
+    }
+}
+
+fn toggle_start_on_login() {
+    let mut guard = STATE.lock().unwrap();
+    if let Some(state) = guard.as_mut() {
+        state.start_on_login = !state.start_on_login;
+        set_start_on_login(state.start_on_login);
+        persist_settings(state);
     }
 }
 
