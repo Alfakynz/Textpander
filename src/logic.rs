@@ -50,7 +50,7 @@ pub fn apply_case(expansion: &str, style: &CaseStyle) -> String {
     }
 }
 
-/// Parses config.json into a lowercase-keyed abbreviation -> expansion map.
+/// Parses replacements.json into a lowercase-keyed abbreviation -> expansion map.
 pub fn load_config_map(json_text: &str) -> Result<HashMap<String, String>, serde_json::Error> {
     let raw: HashMap<String, String> = serde_json::from_str(json_text)?;
     let mut map = HashMap::with_capacity(raw.len());

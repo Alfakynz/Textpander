@@ -1,6 +1,6 @@
 # Textpander
 
-An app that runs as a tray icon and expands abbreviations as you type, anywhere on the system, based on `config.json`. I used AI (Claude) to make it. 
+An app that runs as a tray icon and expands abbreviations as you type, anywhere on the system, based on `replacements.json`. I used AI (Claude) to make it. 
 
 Typing `pls` then a space/Enter/Tab becomes `please`:
 
@@ -18,10 +18,18 @@ Go to the [releases page](https://github.com/Alfakynz/Textpander/releases) and d
 
 To build from source, clone this repository and run `cargo build --release`. The executable will be located in `target/release/textpander.exe`.
 
+## Configuration
+
+Textpander stores its files in `%APPDATA%\Textpander\`:
+
+- `replacements.json`: the abbreviation --> expansion pairs
+- `config.json`: app settings (currently just whether replacements start enabled)
+
+Both are created with sensible defaults on first run if missing. Use the tray menu ("Open replacements.json" / "Open settings (config.json)") to edit them, then "Reload replacements" to pick up changes without restarting.
+
 ## TODO
 
 - Installer
-- Configs on `AppData` (`dictionary.json` for replacements and `config.json` for settings)
 - Replacement with other characters (`" , ) : ; ? !`)
 - Start on login
 - About

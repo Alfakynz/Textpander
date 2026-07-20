@@ -4,6 +4,7 @@
 // Windows, so it can be unit-tested on any platform.
 
 use crate::logic;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
@@ -46,6 +47,7 @@ const ID_OPEN_CONFIG: usize = 1002;
 const ID_EXIT: usize = 1003;
 const ID_TOGGLE_ENABLED: usize = 1004;
 const ID_HIDE_TRAY: usize = 1005;
+const ID_OPEN_SETTINGS: usize = 1006;
 const TRAY_ID: u32 = 1;
 const MAX_BUFFER_LEN: usize = 64;
 
@@ -68,7 +70,8 @@ struct LastExpansion {
 
 struct AppState {
     config: HashMap<String, String>,
-    config_path: PathBuf,
+    replacements_path: PathBuf,
+    settings_path: PathBuf,
     buffer: String,
     last_expansion: Option<LastExpansion>,
     /// Set right after an undo, so that hitting the boundary key again
@@ -162,44 +165,119 @@ fn load_app_icon(hinstance: HINSTANCE, cx: i32, cy: i32) -> HICON {
     }
 }
 
-fn default_config_path() -> PathBuf {
-    let mut path = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    path.pop();
-    path.push("config.json");
-    path
+/// Root folder for all Textpander config files: `%APPDATA%\Textpander`.
+/// Falls back to the folder next to the executable if APPDATA isn't set
+/// (unusual on Windows, but keeps the app working rather than crashing).
+/// Created on demand if it doesn't exist yet.
+fn app_data_dir() -> PathBuf {
+    let base = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut p = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+            p.pop();
+            p
+        });
+    let dir = base.join("Textpander");
+    let _ = fs::create_dir_all(&dir);
+    dir
 }
 
-const DEFAULT_CONFIG: &str = r#"{
-    "bjr": "bonjour",
+/// Abbreviation -> expansion pairs. Formerly named config.json; kept as
+/// separate concern from the app-level settings in config.json below.
+fn replacements_path() -> PathBuf {
+    app_data_dir().join("replacements.json")
+}
+
+/// App-level settings (currently just whether replacements start enabled).
+fn settings_path() -> PathBuf {
+    app_data_dir().join("config.json")
+}
+
+const DEFAULT_REPLACEMENTS: &str = r#"{
+    "pls": "please",
     "btw": "by the way",
     "thx": "thanks",
     "idk": "I don't know"
 }
 "#;
 
-fn ensure_config_exists(path: &PathBuf) {
+fn ensure_replacements_exists(path: &PathBuf) {
     if !path.exists() {
-        let _ = fs::write(path, DEFAULT_CONFIG);
+        let _ = fs::write(path, DEFAULT_REPLACEMENTS);
     }
 }
 
-fn load_config(path: &PathBuf) -> HashMap<String, String> {
-    ensure_config_exists(path);
+fn load_replacements(path: &PathBuf) -> HashMap<String, String> {
+    ensure_replacements_exists(path);
     match fs::read_to_string(path) {
         Ok(text) => match logic::load_config_map(&text) {
             Ok(map) => map,
             Err(e) => {
                 show_message(&format!(
-                    "config.json is not valid JSON:\n{}\n\nNo abbreviations were loaded until this is fixed.",
+                    "replacements.json is not valid JSON:\n{}\n\nNo abbreviations were loaded until this is fixed.",
                     e
                 ));
                 HashMap::new()
             }
         },
         Err(e) => {
-            show_message(&format!("Could not read config.json:\n{}", e));
+            show_message(&format!("Could not read replacements.json:\n{}", e));
             HashMap::new()
         }
+    }
+}
+
+/// App-level settings, persisted to config.json (separate from the
+/// abbreviation list in replacements.json).
+#[derive(Debug, Serialize, Deserialize)]
+struct AppSettings {
+    /// Whether replacements are active on startup. Kept in sync with the
+    /// tray "Enable/Disable replacements" toggle.
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        AppSettings { enabled: true }
+    }
+}
+
+const DEFAULT_SETTINGS: &str = "{\n    \"enabled\": true\n}\n";
+
+fn ensure_settings_exists(path: &PathBuf) {
+    if !path.exists() {
+        let _ = fs::write(path, DEFAULT_SETTINGS);
+    }
+}
+
+fn load_settings(path: &PathBuf) -> AppSettings {
+    ensure_settings_exists(path);
+    match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(settings) => settings,
+            Err(e) => {
+                show_message(&format!(
+                    "config.json is not valid JSON:\n{}\n\nUsing default settings until this is fixed.",
+                    e
+                ));
+                AppSettings::default()
+            }
+        },
+        Err(e) => {
+            show_message(&format!("Could not read config.json:\n{}", e));
+            AppSettings::default()
+        }
+    }
+}
+
+fn save_settings(path: &PathBuf, settings: &AppSettings) {
+    if let Ok(text) = serde_json::to_string_pretty(settings) {
+        let _ = fs::write(path, text);
     }
 }
 
@@ -289,18 +367,21 @@ pub fn run() {
             null_mut(),
         );
 
-        let config_path = default_config_path();
-        let config = load_config(&config_path);
+        let replacements_path = replacements_path();
+        let settings_path = settings_path();
+        let config = load_replacements(&replacements_path);
+        let settings = load_settings(&settings_path);
 
         *STATE.lock().unwrap() = Some(AppState {
             config,
-            config_path,
+            replacements_path,
+            settings_path,
             buffer: String::new(),
             last_expansion: None,
             suppress_expansion: false,
             suppress_next_keyup: None,
             pending_word: None,
-            enabled: true,
+            enabled: settings.enabled,
             tray_visible: true,
         });
 
@@ -355,7 +436,10 @@ unsafe extern "system" fn wndproc(
                     reload_config();
                 }
                 ID_OPEN_CONFIG => {
-                    open_config();
+                    open_replacements();
+                }
+                ID_OPEN_SETTINGS => {
+                    open_settings();
                 }
                 ID_TOGGLE_ENABLED => {
                     toggle_enabled();
@@ -396,8 +480,9 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     };
     let toggle_label = to_wide(toggle_text);
     let hide_label = to_wide("Hide tray");
-    let reload_label = to_wide("Reload config");
-    let open_label = to_wide("Open config.json");
+    let reload_label = to_wide("Reload replacements");
+    let open_label = to_wide("Open replacements.json");
+    let open_settings_label = to_wide("Open settings (config.json)");
     let exit_label = to_wide("Exit");
 
     AppendMenuW(menu, MF_STRING, ID_TOGGLE_ENABLED, toggle_label.as_ptr());
@@ -405,6 +490,12 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
     AppendMenuW(menu, MF_STRING, ID_RELOAD, reload_label.as_ptr());
     AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, open_label.as_ptr());
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_OPEN_SETTINGS,
+        open_settings_label.as_ptr(),
+    );
     AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
     AppendMenuW(menu, MF_STRING, ID_EXIT, exit_label.as_ptr());
 
@@ -483,13 +574,19 @@ fn toggle_enabled() {
         state.last_expansion = None;
         state.suppress_expansion = false;
         state.pending_word = None;
+        save_settings(
+            &state.settings_path,
+            &AppSettings {
+                enabled: state.enabled,
+            },
+        );
     }
 }
 
 fn reload_config() {
     let mut guard = STATE.lock().unwrap();
     if let Some(state) = guard.as_mut() {
-        state.config = load_config(&state.config_path);
+        state.config = load_replacements(&state.replacements_path);
         state.buffer.clear();
         state.last_expansion = None;
         state.suppress_expansion = false;
@@ -497,12 +594,30 @@ fn reload_config() {
     }
 }
 
-fn open_config() {
+fn open_replacements() {
     let guard = STATE.lock().unwrap();
     if let Some(state) = guard.as_ref() {
         unsafe {
             let op = to_wide("open");
-            let path = to_wide(state.config_path.to_string_lossy().as_ref());
+            let path = to_wide(state.replacements_path.to_string_lossy().as_ref());
+            ShellExecuteW(
+                null_mut(),
+                op.as_ptr(),
+                path.as_ptr(),
+                null_mut(),
+                null_mut(),
+                winapi::um::winuser::SW_SHOWNORMAL as i32,
+            );
+        }
+    }
+}
+
+fn open_settings() {
+    let guard = STATE.lock().unwrap();
+    if let Some(state) = guard.as_ref() {
+        unsafe {
+            let op = to_wide("open");
+            let path = to_wide(state.settings_path.to_string_lossy().as_ref());
             ShellExecuteW(
                 null_mut(),
                 op.as_ptr(),
