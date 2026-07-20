@@ -52,7 +52,7 @@ const MAX_BUFFER_LEN: usize = 64;
 /// A name used both for the single-instance mutex and as the base for the
 /// registered "wake up and show your tray icon again" window message.
 /// Kept fairly unique to avoid colliding with unrelated apps.
-const APP_UNIQUE_NAME: &str = "TextExpanderTx_Alfakynz_9F3D2A17";
+const APP_UNIQUE_NAME: &str = "Textpander_Alfakynz";
 
 /// Value returned by RegisterWindowMessageW, computed once at startup and
 /// used both to post the message (from a second launched instance) and to
@@ -81,6 +81,15 @@ struct AppState {
     /// or the undo Backspace), we must also swallow its matching keyup so
     /// the target app doesn't see an orphaned key-up event.
     suppress_next_keyup: Option<i32>,
+    /// The word just finished by a boundary key (space/enter/tab) that did
+    /// *not* match any abbreviation. Kept for exactly one Backspace: if the
+    /// very next key is Backspace (deleting that boundary character), the
+    /// buffer is restored to this word so correcting a typo - e.g. typing
+    /// "bjt", noticing the mistake, backspacing over the space and the "t",
+    /// then typing "r" - still gets tracked as "bjr" and can expand.
+    /// Cleared by any other key, so it never resurrects a long-abandoned
+    /// word.
+    pending_word: Option<String>,
     /// When false, the hook only ever passes keys through untouched - no
     /// buffer tracking, no expansion, no undo.
     enabled: bool,
@@ -162,9 +171,9 @@ fn default_config_path() -> PathBuf {
 
 const DEFAULT_CONFIG: &str = r#"{
     "bjr": "bonjour",
-    "mdr": "mort de rire",
-    "tlm": "tout le monde",
-    "stp": "s'il te plait"
+    "btw": "by the way",
+    "thx": "thanks",
+    "idk": "I don't know"
 }
 "#;
 
@@ -197,7 +206,7 @@ fn load_config(path: &PathBuf) -> HashMap<String, String> {
 fn show_message(text: &str) {
     unsafe {
         let wtext = to_wide(text);
-        let wtitle = to_wide("Text Expander");
+        let wtitle = to_wide("Textpander");
         winapi::um::winuser::MessageBoxW(
             null_mut(),
             wtext.as_ptr(),
@@ -219,7 +228,7 @@ pub fn run() {
         let mutex_handle = CreateMutexW(null_mut(), 0, mutex_name.as_ptr());
         let already_running = !mutex_handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS;
 
-        let class_name = to_wide("TextExpanderHiddenWindowClass");
+        let class_name = to_wide("TextpanderHiddenWindowClass");
         let wake_message_name = to_wide(&format!("{}_WakeMessage", APP_UNIQUE_NAME));
         let wake_msg = RegisterWindowMessageW(wake_message_name.as_ptr());
         WAKE_MSG.store(wake_msg, Ordering::SeqCst);
@@ -264,7 +273,7 @@ pub fn run() {
         };
         RegisterClassW(&wnd_class);
 
-        let window_title = to_wide("Text Expander");
+        let window_title = to_wide("Textpander");
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
@@ -290,6 +299,7 @@ pub fn run() {
             last_expansion: None,
             suppress_expansion: false,
             suppress_next_keyup: None,
+            pending_word: None,
             enabled: true,
             tray_visible: true,
         });
@@ -428,7 +438,7 @@ fn show_tray_icon() {
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             nid.uCallbackMessage = WM_TRAYICON;
             nid.hIcon = tray.icon;
-            let tip = to_wide("Text Expander (abbreviation replacement)");
+            let tip = to_wide("Textpander (abbreviation replacement)");
             let n = tip.len().min(nid.szTip.len());
             nid.szTip[..n].copy_from_slice(&tip[..n]);
             // NIM_ADD on an icon that's already present simply fails
@@ -472,6 +482,7 @@ fn toggle_enabled() {
         state.buffer.clear();
         state.last_expansion = None;
         state.suppress_expansion = false;
+        state.pending_word = None;
     }
 }
 
@@ -482,6 +493,7 @@ fn reload_config() {
         state.buffer.clear();
         state.last_expansion = None;
         state.suppress_expansion = false;
+        state.pending_word = None;
     }
 }
 
@@ -684,6 +696,7 @@ fn handle_keydown(vk: i32, scan_code: u32) -> bool {
         state.buffer.clear();
         state.last_expansion = None;
         state.suppress_expansion = false;
+        state.pending_word = None;
         return false;
     }
 
@@ -697,12 +710,25 @@ fn handle_keydown(vk: i32, scan_code: u32) -> bool {
             perform_undo(&last);
             return true;
         }
+        // Backspace pressed right after a boundary key that did *not*
+        // trigger an expansion (e.g. "pld" + space, no match): this
+        // Backspace is deleting that boundary character on screen, so
+        // resume tracking from the word as it stood right before it,
+        // instead of starting over from an empty buffer. This is what
+        // makes "type pld, notice the typo, backspace twice, type s"
+        // still resolve to "pls" -> please.
+        if let Some(pending) = state.pending_word.take() {
+            state.buffer = pending;
+            return false;
+        }
         state.buffer.pop();
         return false;
     }
 
-    // Any key other than Backspace closes the "undo window".
+    // Any key other than Backspace closes the "undo window" and abandons
+    // any pending (unmatched) word - it's genuinely a new context now.
     state.last_expansion = None;
+    state.pending_word = None;
 
     if vk == VK_SPACE || vk == VK_RETURN || vk == VK_TAB {
         // One-shot: if this boundary key comes right after an undo with no
@@ -726,6 +752,14 @@ fn handle_keydown(vk: i32, scan_code: u32) -> bool {
                 return true;
             }
         }
+        // No match (or a one-shot-suppressed undo occurrence): remember
+        // this word for exactly one Backspace, in case the user steps
+        // back in to correct it.
+        state.pending_word = if state.buffer.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut state.buffer))
+        };
         state.buffer.clear();
         return false;
     }
