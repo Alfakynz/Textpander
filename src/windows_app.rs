@@ -39,11 +39,10 @@ use winapi::um::winuser::{
     UnhookWindowsHookEx, HC_ACTION, IDI_APPLICATION, IMAGE_ICON, INPUT, INPUT_KEYBOARD,
     KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LLKHF_INJECTED,
     LR_DEFAULTSIZE, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SM_CXSMICON,
-    SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, VK_BACK, VK_CAPITAL,
-    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN,
-    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, WH_KEYBOARD_LL, WM_APP, WM_COMMAND,
-    WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WNDCLASSW,
+    SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, VK_BACK, VK_CAPITAL, VK_CONTROL,
+    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, WH_KEYBOARD_LL, WM_APP, WM_COMMAND, WM_DESTROY,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
 };
 
 const WM_TRAYICON: UINT = WM_APP + 1;
@@ -54,8 +53,13 @@ const ID_TOGGLE_ENABLED: usize = 1004;
 const ID_HIDE_TRAY: usize = 1005;
 const ID_OPEN_SETTINGS: usize = 1006;
 const ID_TOGGLE_STARTUP: usize = 1007;
+const ID_ABOUT: usize = 1008;
 const TRAY_ID: u32 = 1;
 const MAX_BUFFER_LEN: usize = 64;
+
+/// Change this to point at wherever you want the About dialog's link to go
+/// (a GitHub repo, a personal site, etc).
+const ABOUT_URL: &str = "https://github.com/Alfakynz/Textpander";
 
 /// A name used both for the single-instance mutex and as the base for the
 /// registered "wake up and show your tray icon again" window message.
@@ -269,7 +273,8 @@ impl Default for AppSettings {
     }
 }
 
-const DEFAULT_SETTINGS: &str = "{\n    \"enabled\": true,\n    \"show_tray_icon\": true,\n    \"start_on_login\": false\n}\n";
+const DEFAULT_SETTINGS: &str =
+    "{\n    \"enabled\": true,\n    \"show_tray_icon\": true,\n    \"start_on_login\": false\n}\n";
 
 fn ensure_settings_exists(path: &PathBuf) {
     if !path.exists() {
@@ -542,6 +547,9 @@ unsafe extern "system" fn wndproc(
                 ID_HIDE_TRAY => {
                     hide_tray_icon();
                 }
+                ID_ABOUT => {
+                    show_about_window();
+                }
                 ID_EXIT => {
                     DestroyWindow(hwnd);
                 }
@@ -579,12 +587,23 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let reload_label = to_wide("Reload replacements");
     let open_label = to_wide("Open replacements.json");
     let open_settings_label = to_wide("Open settings (config.json)");
+    let about_label = to_wide("About");
     let exit_label = to_wide("Exit");
 
     AppendMenuW(menu, MF_STRING, ID_TOGGLE_ENABLED, toggle_label.as_ptr());
     AppendMenuW(menu, MF_STRING, ID_HIDE_TRAY, hide_label.as_ptr());
-    let startup_flags = MF_STRING | if start_on_login { MF_CHECKED } else { MF_UNCHECKED };
-    AppendMenuW(menu, startup_flags, ID_TOGGLE_STARTUP, startup_label.as_ptr());
+    let startup_flags = MF_STRING
+        | if start_on_login {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    AppendMenuW(
+        menu,
+        startup_flags,
+        ID_TOGGLE_STARTUP,
+        startup_label.as_ptr(),
+    );
     AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
     AppendMenuW(menu, MF_STRING, ID_RELOAD, reload_label.as_ptr());
     AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, open_label.as_ptr());
@@ -594,6 +613,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         ID_OPEN_SETTINGS,
         open_settings_label.as_ptr(),
     );
+    AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
+    AppendMenuW(menu, MF_STRING, ID_ABOUT, about_label.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
     AppendMenuW(menu, MF_STRING, ID_EXIT, exit_label.as_ptr());
 
@@ -613,6 +634,26 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     );
     winapi::um::winuser::PostMessageW(hwnd, winapi::um::winuser::WM_NULL, 0, 0);
     winapi::um::winuser::DestroyMenu(menu);
+}
+
+/// Shows a native About dialog (a plain MessageBoxW). The link is included
+/// as plain, selectable/copyable text rather than a clickable control -
+/// simpler and guaranteed to render exactly like any other native Windows
+/// dialog, at the cost of not being a clickable link.
+fn show_about_window() {
+    unsafe {
+        let text = to_wide(&format!(
+            "Textpander 1.0.0\n\nMade by Alfakynz.\n\n{}",
+            ABOUT_URL
+        ));
+        let title = to_wide("About Textpander");
+        winapi::um::winuser::MessageBoxW(
+            null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONINFORMATION,
+        );
+    }
 }
 
 /// Adds the tray icon back (idempotent: safe to call even if already shown).

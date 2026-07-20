@@ -31,4 +31,3 @@ Both are created with sensible defaults on first run if missing. Use the tray me
 
 - Installer
 - Replacement with other characters (`" , ) : ; ? !`)
-- About
