@@ -29,4 +29,4 @@ Both are created with sensible defaults on first run if missing. Use the tray me
 
 ## TODO
 
-- Replacement with other characters (`" , ) : ; ? !`)
+- Fix replacements with `] }`

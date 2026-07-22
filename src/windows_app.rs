@@ -41,7 +41,7 @@ use winapi::um::winuser::{
     LR_DEFAULTSIZE, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SM_CXSMICON,
     SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, VK_BACK, VK_CAPITAL, VK_CONTROL,
     VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, WH_KEYBOARD_LL, WM_APP, WM_COMMAND, WM_DESTROY,
+    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, WH_KEYBOARD_LL, WM_APP, WM_COMMAND, WM_DESTROY,
     WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
 };
 
@@ -84,6 +84,10 @@ struct AppState {
     settings_path: PathBuf,
     buffer: String,
     last_expansion: Option<LastExpansion>,
+    /// Characters that trigger an expansion attempt when typed (in addition
+    /// to Enter and Tab, which always do). Configurable via the
+    /// "characters" array in config.json, e.g. [" ", ",", ")"].
+    boundary_chars: Vec<char>,
     /// Set right after an undo, so that hitting the boundary key again
     /// immediately (without typing any more letters) does not silently
     /// re-expand the same occurrence. Cleared as soon as a letter is typed
@@ -257,10 +261,20 @@ struct AppSettings {
     /// Kept in sync with the tray "Start on login" toggle.
     #[serde(default)]
     start_on_login: bool,
+    /// Characters that trigger an expansion attempt when typed, e.g.
+    /// [" ", ",", ")"]. Enter and Tab always trigger one regardless of
+    /// this list. Each entry should be a single character; longer strings
+    /// are ignored (only the first character is used).
+    #[serde(default = "default_boundary_characters")]
+    characters: Vec<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_boundary_characters() -> Vec<String> {
+    vec![" ".to_string()]
 }
 
 impl Default for AppSettings {
@@ -269,12 +283,29 @@ impl Default for AppSettings {
             enabled: true,
             show_tray_icon: true,
             start_on_login: false,
+            characters: default_boundary_characters(),
         }
     }
 }
 
-const DEFAULT_SETTINGS: &str =
-    "{\n    \"enabled\": true,\n    \"show_tray_icon\": true,\n    \"start_on_login\": false\n}\n";
+/// Converts the "characters" JSON string list into actual chars for fast
+/// lookup while typing. Empty strings are skipped; only the first
+/// character of any multi-character entry is used.
+fn boundary_chars_from_settings(settings: &AppSettings) -> Vec<char> {
+    settings
+        .characters
+        .iter()
+        .filter_map(|s| s.chars().next())
+        .collect()
+}
+
+const DEFAULT_SETTINGS: &str = r#"{
+    "enabled": true,
+    "show_tray_icon": true,
+    "start_on_login": false,
+    "characters": [" ", ",", ".", ";", ":", "!", "?", ")", "\"", "\n"]
+}
+"#;
 
 fn ensure_settings_exists(path: &PathBuf) {
     if !path.exists() {
@@ -316,6 +347,7 @@ fn persist_settings(state: &AppState) {
         enabled: state.enabled,
         show_tray_icon: state.tray_visible,
         start_on_login: state.start_on_login,
+        characters: state.boundary_chars.iter().map(|c| c.to_string()).collect(),
     };
     save_settings(&state.settings_path, &settings);
 }
@@ -460,6 +492,7 @@ pub fn run() {
         let settings_path = settings_path();
         let config = load_replacements(&replacements_path);
         let settings = load_settings(&settings_path);
+        let boundary_chars = boundary_chars_from_settings(&settings);
 
         // Keep the registry in sync with the persisted preference, in case
         // it was changed by hand in config.json or the Run key was cleared
@@ -472,6 +505,7 @@ pub fn run() {
             settings_path,
             buffer: String::new(),
             last_expansion: None,
+            boundary_chars,
             suppress_expansion: false,
             suppress_next_keyup: None,
             pending_word: None,
@@ -584,7 +618,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let toggle_label = to_wide(toggle_text);
     let hide_label = to_wide("Hide tray");
     let startup_label = to_wide("Start on login");
-    let reload_label = to_wide("Reload replacements");
+    let reload_label = to_wide("Reload app");
     let open_label = to_wide("Open replacements.json");
     let open_settings_label = to_wide("Open settings (config.json)");
     let about_label = to_wide("About");
@@ -737,14 +771,43 @@ fn toggle_start_on_login() {
     }
 }
 
+/// Reloads both replacements.json and config.json from disk, and actually
+/// applies every setting from config.json (enabled, tray visibility,
+/// start-on-login) - not just the "characters" list. So if you hand-edit
+/// config.json while the app is running, this button picks up all of it,
+/// including flipping the tray icon or the login-startup registry entry to
+/// match what's now in the file.
 fn reload_config() {
     let mut guard = STATE.lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.config = load_replacements(&state.replacements_path);
-        state.buffer.clear();
-        state.last_expansion = None;
-        state.suppress_expansion = false;
-        state.pending_word = None;
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+
+    state.config = load_replacements(&state.replacements_path);
+
+    let settings = load_settings(&state.settings_path);
+    state.boundary_chars = boundary_chars_from_settings(&settings);
+    state.enabled = settings.enabled;
+    state.start_on_login = settings.start_on_login;
+
+    state.buffer.clear();
+    state.last_expansion = None;
+    state.suppress_expansion = false;
+    state.pending_word = None;
+
+    let want_tray_visible = settings.show_tray_icon;
+    let want_start_on_login = settings.start_on_login;
+
+    // Drop the lock before calling functions that take it themselves
+    // (show_tray_icon/hide_tray_icon), to avoid locking STATE twice.
+    drop(guard);
+
+    set_start_on_login(want_start_on_login);
+    if want_tray_visible {
+        show_tray_icon();
+    } else {
+        hide_tray_icon();
     }
 }
 
@@ -999,63 +1062,89 @@ fn handle_keydown(vk: i32, scan_code: u32) -> bool {
     state.last_expansion = None;
     state.pending_word = None;
 
-    if vk == VK_SPACE || vk == VK_RETURN || vk == VK_TAB {
-        // One-shot: if this boundary key comes right after an undo with no
-        // letters typed in between, don't re-expand the same occurrence.
-        let skip_due_to_undo = std::mem::replace(&mut state.suppress_expansion, false);
-        if !skip_due_to_undo && !state.buffer.is_empty() {
-            if let Some(expansion) = logic::expand(&state.config, &state.buffer) {
-                let typed = std::mem::take(&mut state.buffer);
-                let abbr_len = typed.chars().count();
-                state.last_expansion = Some(LastExpansion {
-                    typed,
-                    expansion: expansion.clone(),
-                });
-                state.suppress_next_keyup = Some(vk);
-                drop(guard);
-                perform_replacement(abbr_len, &expansion, vk);
-                // We swallow the boundary key ourselves and re-type it as
-                // part of the replacement, so the caller must not let the
-                // original keystroke through too (that was the cause of
-                // the double-space bug).
-                return true;
+    // One-shot: if this key comes right after an undo with no letters
+    // typed in between, don't re-expand on the next boundary. Reading this
+    // via mem::replace resets it for every key (not just boundary keys),
+    // matching the original behavior: typing any further letter closes the
+    // undo window just as much as reaching a boundary does.
+    let skip_due_to_undo = std::mem::replace(&mut state.suppress_expansion, false);
+
+    // Enter and Tab are always boundary keys, regardless of config.json.
+    // Anything else is a boundary only if the character it produces is in
+    // the user-configurable "characters" list (default: just space).
+    let boundary: Option<Boundary> = if vk == VK_RETURN || vk == VK_TAB {
+        Some(Boundary::Key(vk))
+    } else {
+        match char_from_vk(vk, scan_code) {
+            Some(ch) if state.boundary_chars.contains(&ch) => Some(Boundary::Char(ch)),
+            Some(ch) => {
+                // Not a configured boundary character: just a regular
+                // character to add to the buffer (letters, digits, symbols
+                // like '@' that aren't in the "characters" list).
+                if state.buffer.len() < MAX_BUFFER_LEN {
+                    state.buffer.push(ch);
+                } else {
+                    state.buffer.clear();
+                }
+                None
+            }
+            None => {
+                // Doesn't produce a character (arrows, function keys, etc.):
+                // breaks the word context.
+                state.buffer.clear();
+                None
             }
         }
-        // No match (or a one-shot-suppressed undo occurrence): remember
-        // this word for exactly one Backspace, in case the user steps
-        // back in to correct it.
-        state.pending_word = if state.buffer.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut state.buffer))
-        };
-        state.buffer.clear();
-        return false;
-    }
+    };
 
-    state.suppress_expansion = false;
+    let boundary = match boundary {
+        Some(b) => b,
+        None => return false,
+    };
 
-    // Anything else: resolve the actual character this key produces,
-    // honoring the real keyboard layout (Shift, CapsLock, AltGr), so
-    // abbreviations can contain letters, digits, or symbols like '@' -
-    // not just plain A-Z. Keys that don't produce a character (arrows,
-    // function keys, digits-as-shortcuts, etc.) break the word context.
-    if let Some(ch) = char_from_vk(vk, scan_code) {
-        if state.buffer.len() < MAX_BUFFER_LEN {
-            state.buffer.push(ch);
-        } else {
-            state.buffer.clear();
+    if !skip_due_to_undo && !state.buffer.is_empty() {
+        if let Some(expansion) = logic::expand(&state.config, &state.buffer) {
+            let typed = std::mem::take(&mut state.buffer);
+            let abbr_len = typed.chars().count();
+            state.last_expansion = Some(LastExpansion {
+                typed,
+                expansion: expansion.clone(),
+            });
+            state.suppress_next_keyup = Some(vk);
+            drop(guard);
+            perform_replacement(abbr_len, &expansion, boundary);
+            // We swallow the boundary key ourselves and re-type it as
+            // part of the replacement, so the caller must not let the
+            // original keystroke through too (that was the cause of
+            // the double-space bug).
+            return true;
         }
-    } else {
-        state.buffer.clear();
     }
+    // No match (or a one-shot-suppressed undo occurrence): remember
+    // this word for exactly one Backspace, in case the user steps
+    // back in to correct it.
+    state.pending_word = if state.buffer.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(&mut state.buffer))
+    };
+    state.buffer.clear();
     false
 }
 
+/// A key that finished a word and should trigger an expansion check: either
+/// a structural key (Enter/Tab, always active), or a specific character
+/// from the user-configurable "characters" list in config.json.
+#[derive(Clone, Copy)]
+enum Boundary {
+    Key(i32),
+    Char(char),
+}
+
 /// Deletes the typed abbreviation, then types the expansion followed by the
-/// boundary key (space / enter / tab) that triggered it. The real boundary
-/// keystroke is swallowed by the hook, so this is the only copy of it.
-fn perform_replacement(abbr_len: usize, expansion: &str, boundary_vk: i32) {
+/// boundary key/character that triggered it. The real boundary keystroke is
+/// swallowed by the hook, so this is the only copy of it.
+fn perform_replacement(abbr_len: usize, expansion: &str, boundary: Boundary) {
     let mut inputs: Vec<INPUT> = Vec::new();
 
     for _ in 0..abbr_len {
@@ -1070,8 +1159,19 @@ fn perform_replacement(abbr_len: usize, expansion: &str, boundary_vk: i32) {
         push_unicode_input(&mut inputs, unit, true);
     }
 
-    push_vk_input(&mut inputs, boundary_vk as u16, false);
-    push_vk_input(&mut inputs, boundary_vk as u16, true);
+    match boundary {
+        Boundary::Key(vk) => {
+            push_vk_input(&mut inputs, vk as u16, false);
+            push_vk_input(&mut inputs, vk as u16, true);
+        }
+        Boundary::Char(ch) => {
+            let mut buf = [0u16; 2];
+            for unit in ch.encode_utf16(&mut buf).iter() {
+                push_unicode_input(&mut inputs, *unit, false);
+                push_unicode_input(&mut inputs, *unit, true);
+            }
+        }
+    }
 
     unsafe {
         SendInput(
