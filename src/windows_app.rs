@@ -34,15 +34,16 @@ use winapi::um::winuser::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, FindWindowW, GetAsyncKeyState, GetCursorPos, GetForegroundWindow,
     GetKeyState, GetKeyboardLayout, GetMessageW, GetSystemMetrics, GetWindowThreadProcessId,
-    LoadIconW, LoadImageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendInput,
-    SetForegroundWindow, SetWindowsHookExW, ToUnicodeEx, TrackPopupMenu, TranslateMessage,
-    UnhookWindowsHookEx, HC_ACTION, IDI_APPLICATION, IMAGE_ICON, INPUT, INPUT_KEYBOARD,
-    KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LLKHF_INJECTED,
-    LR_DEFAULTSIZE, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SM_CXSMICON,
-    SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, VK_BACK, VK_CAPITAL, VK_CONTROL,
-    VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, WH_KEYBOARD_LL, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+    LoadIconW, LoadImageW, MapVirtualKeyExW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SendInput, SetForegroundWindow, SetWindowsHookExW, ToUnicodeEx,
+    TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, IDI_APPLICATION, IMAGE_ICON,
+    INPUT, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    LLKHF_INJECTED, LR_DEFAULTSIZE, MAPVK_VK_TO_CHAR, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, MSG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
+    VK_BACK, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+    VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, WH_KEYBOARD_LL, WM_APP,
+    WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WNDCLASSW,
 };
 
 const WM_TRAYICON: UINT = WM_APP + 1;
@@ -107,6 +108,15 @@ struct AppState {
     /// Cleared by any other key, so it never resurrects a long-abandoned
     /// word.
     pending_word: Option<String>,
+    /// Set when the previous key was a dead key (an accent waiting to
+    /// combine, e.g. "^", or "~" typed via AltGr). The *next* key must
+    /// never be run through ToUnicodeEx either - even though it isn't a
+    /// dead key itself, calling ToUnicodeEx on it would consume the
+    /// composition the target app is still waiting to finish, breaking the
+    /// accent there too. So this next key is treated as unknown (buffer
+    /// reset) and left completely untouched, letting the target app
+    /// compose the accent on its own.
+    skip_next_char_resolution: bool,
     /// When false, the hook only ever passes keys through untouched - no
     /// buffer tracking, no expansion, no undo.
     enabled: bool,
@@ -509,6 +519,7 @@ pub fn run() {
             suppress_expansion: false,
             suppress_next_keyup: None,
             pending_word: None,
+            skip_next_char_resolution: false,
             enabled: settings.enabled,
             tray_visible: settings.show_tray_icon,
             start_on_login: settings.start_on_login,
@@ -677,7 +688,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 fn show_about_window() {
     unsafe {
         let text = to_wide(&format!(
-            "Textpander 1.0.0\n\nMade by Alfakynz.\n\n{}",
+            "Textpander 1.0.1\n\nMade by Alfakynz.\n\n{}",
             ABOUT_URL
         ));
         let title = to_wide("About Textpander");
@@ -758,6 +769,7 @@ fn toggle_enabled() {
         state.last_expansion = None;
         state.suppress_expansion = false;
         state.pending_word = None;
+        state.skip_next_char_resolution = false;
         persist_settings(state);
     }
 }
@@ -795,6 +807,7 @@ fn reload_config() {
     state.last_expansion = None;
     state.suppress_expansion = false;
     state.pending_word = None;
+    state.skip_next_char_resolution = false;
 
     let want_tray_visible = settings.show_tray_icon;
     let want_start_on_login = settings.start_on_login;
@@ -861,15 +874,50 @@ fn is_capslock_on() -> bool {
     unsafe { (GetKeyState(VK_CAPITAL) as u16 & 0x0001) != 0 }
 }
 
+/// Result of resolving what a keydown actually produces.
+enum KeyChar {
+    /// This key is a dead key (an accent waiting to combine with the next
+    /// letter, e.g. "^" then "e" -> "ê" on many layouts, or "~" then "n" ->
+    /// "ñ" via AltGr). See the comment on `skip_next_char_resolution` in
+    /// AppState for why the key *following* a dead key needs special
+    /// handling too.
+    DeadKey,
+    /// A normal resolved character.
+    Char(char),
+    /// Not a dead key, but no printable character came out of it either
+    /// (arrows, function keys, etc).
+    None,
+}
+
 /// Resolves the actual Unicode character a key produces, honoring the real
-/// keyboard layout of the focused window (Shift, CapsLock, and AltGr - e.g.
-/// '@' on many European/AZERTY layouts is AltGr + a digit key). We build the
+/// keyboard layout of the focused window (Shift, CapsLock, AltGr - e.g. '@'
+/// on many European/AZERTY layouts is AltGr + a digit key). We build the
 /// key-state array ourselves from GetAsyncKeyState rather than calling
 /// GetKeyboardState, for the same reason described near is_ctrl_down: this
 /// hook's thread doesn't own the input queue, so thread-scoped state can be
 /// stale or simply never populated.
-fn char_from_vk(vk: i32, scan_code: u32) -> Option<char> {
+fn char_from_vk(vk: i32, scan_code: u32) -> KeyChar {
     unsafe {
+        let foreground = GetForegroundWindow();
+        let thread_id = GetWindowThreadProcessId(foreground, null_mut());
+        let hkl = GetKeyboardLayout(thread_id);
+
+        // MapVirtualKeyExW is a stateless, pure table lookup - it never
+        // touches the OS's dead-key composition state - so it's a free,
+        // safe way to skip the ToUnicodeEx call below entirely for the
+        // common case. Its high bit tells us if this key is a dead key.
+        //
+        // Caveat: it only ever reports a key's *unshifted* base character,
+        // so it can't see a key that only becomes a dead key under AltGr
+        // (e.g. "~" typed as AltGr+2 on AZERTY). That's fine - the
+        // ToUnicodeEx call below still catches those correctly (it *does*
+        // see the real modifier state), we just don't get to skip calling
+        // it for that specific case.
+        let mapped = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_CHAR, hkl);
+        if mapped & 0x8000_0000 != 0 {
+            return KeyChar::DeadKey;
+        }
+
         let mut keyboard_state = [0u8; 256];
         for vk_code in [
             VK_SHIFT,
@@ -887,10 +935,6 @@ fn char_from_vk(vk: i32, scan_code: u32) -> Option<char> {
         }
         keyboard_state[VK_CAPITAL as usize] = if is_capslock_on() { 1 } else { 0 };
 
-        let foreground = GetForegroundWindow();
-        let thread_id = GetWindowThreadProcessId(foreground, null_mut());
-        let hkl = GetKeyboardLayout(thread_id);
-
         let mut buf = [0u16; 8];
         let result = ToUnicodeEx(
             vk as u32,
@@ -902,12 +946,26 @@ fn char_from_vk(vk: i32, scan_code: u32) -> Option<char> {
             hkl,
         );
 
+        // A negative result means this key IS a dead key once the real
+        // modifier state (e.g. AltGr) is taken into account - this is how
+        // we catch the AltGr-only dead keys the pre-check above can't see.
         if result < 0 {
-            // Dead key (an accent waiting to combine with the next letter,
-            // e.g. on some layouts). This call leaves the thread-local
-            // dead-key state primed; flush it immediately so we don't
-            // interfere with the real composition the target app performs
-            // on its own. We don't treat this as a typed character.
+            // This ToUnicodeEx call above just armed the kernel-mode
+            // dead-key buffer as a side effect (documented by Microsoft:
+            // "it also changes the state of the kernel-mode keyboard
+            // buffer... it might also cause undesired side-effects if
+            // used in conjunction with TranslateMessage"). We don't
+            // swallow dead keys - the real keystroke still flows on to
+            // the focused app, which resolves it for real via its own
+            // TranslateMessage call. If we leave the buffer armed from
+            // our own probe, that downstream call sees a dead key
+            // already pending and immediately "consumes" it against
+            // itself, producing a doubled character (e.g. "~~") instead
+            // of waiting for the next letter to combine with it. Calling
+            // ToUnicodeEx again with the exact same parameters consumes
+            // our own bogus arm (result discarded), leaving the buffer
+            // empty so the real downstream processing arms it correctly
+            // on its own.
             let mut flush_buf = [0u16; 8];
             ToUnicodeEx(
                 vk as u32,
@@ -918,14 +976,16 @@ fn char_from_vk(vk: i32, scan_code: u32) -> Option<char> {
                 0,
                 hkl,
             );
-            return None;
+            return KeyChar::DeadKey;
+        }
+        if result == 0 {
+            return KeyChar::None;
         }
 
-        if result <= 0 {
-            return None;
+        match char::from_u32(buf[0] as u32) {
+            Some(ch) => KeyChar::Char(ch),
+            None => KeyChar::None,
         }
-
-        char::from_u32(buf[0] as u32)
     }
 }
 
@@ -1021,18 +1081,26 @@ fn handle_keydown(vk: i32, scan_code: u32) -> bool {
     // the real Ctrl is still held gets reinterpreted as Ctrl+Backspace by
     // the target app, deleting far more than intended.
     //
-    // AltGr (used to type symbols like '@' on many European layouts) shows
-    // up at this level as Ctrl+Alt held *together*, which this check
-    // deliberately lets through to the character-handling code below.
+    // AltGr (used to type '@' and other symbols on many layouts, and also
+    // several accent dead keys like `~` and `` ` ``) shows up here as
+    // Ctrl+Alt held *together*, which is deliberately let through to the
+    // character-handling code below - see char_from_vk / KeyChar::DeadKey
+    // for how dead keys reached via AltGr are still detected safely.
     if (ctrl && !alt) || (alt && !ctrl) {
         state.buffer.clear();
         state.last_expansion = None;
         state.suppress_expansion = false;
         state.pending_word = None;
+        state.skip_next_char_resolution = false;
         return false;
     }
 
     if vk == VK_BACK {
+        // A Backspace cancels any pending dead-key composition, so the
+        // *next* key shouldn't be treated as "right after a dead key"
+        // anymore.
+        state.skip_next_char_resolution = false;
+
         // Backspace pressed right after an expansion: undo it.
         if let Some(last) = state.last_expansion.take() {
             state.buffer = last.typed.clone();
@@ -1074,13 +1142,28 @@ fn handle_keydown(vk: i32, scan_code: u32) -> bool {
     // the user-configurable "characters" list (default: just space).
     let boundary: Option<Boundary> = if vk == VK_RETURN || vk == VK_TAB {
         Some(Boundary::Key(vk))
+    } else if std::mem::replace(&mut state.skip_next_char_resolution, false) {
+        // The previous key was a dead key: this key must be left
+        // completely alone too (see the doc comment on
+        // skip_next_char_resolution), so the target app can finish
+        // composing the accent on its own without any interference from
+        // us, even indirect. Treat it like any other "no character" key.
+        state.buffer.clear();
+        None
     } else {
         match char_from_vk(vk, scan_code) {
-            Some(ch) if state.boundary_chars.contains(&ch) => Some(Boundary::Char(ch)),
-            Some(ch) => {
+            KeyChar::DeadKey => {
+                // Don't touch the buffer: a dead key alone hasn't produced
+                // any visible character yet, so it shouldn't invalidate an
+                // in-progress word. Remember to also skip the next key.
+                state.skip_next_char_resolution = true;
+                None
+            }
+            KeyChar::Char(ch) if state.boundary_chars.contains(&ch) => Some(Boundary::Char(ch)),
+            KeyChar::Char(ch) => {
                 // Not a configured boundary character: just a regular
                 // character to add to the buffer (letters, digits, symbols
-                // like '@' that aren't in the "characters" list).
+                // that aren't in the "characters" list).
                 if state.buffer.len() < MAX_BUFFER_LEN {
                     state.buffer.push(ch);
                 } else {
@@ -1088,7 +1171,7 @@ fn handle_keydown(vk: i32, scan_code: u32) -> bool {
                 }
                 None
             }
-            None => {
+            KeyChar::None => {
                 // Doesn't produce a character (arrows, function keys, etc.):
                 // breaks the word context.
                 state.buffer.clear();

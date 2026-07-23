@@ -29,4 +29,4 @@ Both are created with sensible defaults on first run if missing. Use the tray me
 
 ## TODO
 
-- Fix replacements with `] }`
+- Fix start on login
