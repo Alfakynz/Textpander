@@ -26,7 +26,7 @@ use winapi::um::shellapi::{
     NOTIFYICONDATAW,
 };
 use winapi::um::synchapi::CreateMutexW;
-use winapi::um::winnt::{KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ};
+use winapi::um::winnt::{KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE, REG_SZ};
 use winapi::um::winreg::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY_CURRENT_USER,
 };
@@ -410,6 +410,71 @@ fn set_start_on_login(enabled: bool) {
 
         RegCloseKey(hkey);
     }
+
+    // The Run key alone controls whether an entry *exists*, but Windows
+    // separately tracks whether it's actually *approved* to run (this is
+    // what Task Manager's Startup tab and Settings > Apps > Startup show
+    // and let you toggle). A Run entry added directly to the registry
+    // (rather than by an installer) can end up shown there switched off,
+    // in which case Windows silently skips it at login even though the
+    // Run value is present. Explicitly writing the "approved" state here
+    // avoids depending on that separate, semi-undocumented mechanism
+    // defaulting the right way on its own.
+    set_startup_approved(enabled);
+}
+
+/// Writes (or removes) the corresponding entry under
+/// ...\Explorer\StartupApproved\Run, which is what actually gates whether
+/// Windows executes a Run-key entry at login (see set_start_on_login).
+/// The 12-byte enabled/disabled encoding here isn't formally documented by
+/// Microsoft, but is well established from reverse-engineering by the
+/// Windows forensics community: byte 0 = 0x02 means enabled (the remaining
+/// 11 bytes are unused/zero for that state); anything else, notably 0x03,
+/// means disabled (with a FILETIME of when it was disabled in the
+/// remaining bytes). This is also exactly what Task Manager itself writes
+/// when you click "Enable" on a startup item.
+fn set_startup_approved(enabled: bool) {
+    unsafe {
+        let subkey = to_wide(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run",
+        );
+        let mut hkey: HKEY = null_mut();
+        let status = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            null_mut(),
+            &mut hkey,
+            null_mut(),
+        );
+        if status != 0 || hkey.is_null() {
+            return;
+        }
+
+        let value_name = to_wide(APP_UNIQUE_NAME);
+        if enabled {
+            let data: [u8; 12] = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            RegSetValueExW(
+                hkey,
+                value_name.as_ptr(),
+                0,
+                REG_BINARY,
+                data.as_ptr(),
+                data.len() as u32,
+            );
+        } else {
+            // Not strictly required (Windows only consults this when the
+            // Run entry also exists, which we've just removed), but keeps
+            // the registry tidy rather than leaving a stale approval entry
+            // behind.
+            RegDeleteValueW(hkey, value_name.as_ptr());
+        }
+
+        RegCloseKey(hkey);
+    }
 }
 
 fn show_message(text: &str) {
@@ -688,7 +753,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 fn show_about_window() {
     unsafe {
         let text = to_wide(&format!(
-            "Textpander 1.0.1\n\nMade by Alfakynz.\n\n{}",
+            "Textpander {}\n\nMade by Alfakynz.\n\n{}",
+            env!("CARGO_PKG_VERSION"),
             ABOUT_URL
         ));
         let title = to_wide("About Textpander");

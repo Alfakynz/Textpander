@@ -26,7 +26,3 @@ Textpander stores its files in `%APPDATA%\Textpander\`:
 - `config.json`: app settings - `enabled` (replacements active on startup), `show_tray_icon` (tray icon shown on startup), and `start_on_login` (launch automatically when you log in)
 
 Both are created with sensible defaults on first run if missing. Use the tray menu ("Open replacements.json" / "Open settings (config.json)") to edit them, then "Reload replacements" to pick up changes without restarting. The tray menu's "Hide tray" and "Start on login" toggles update `config.json` automatically, so your choice is remembered the next time the app starts.
-
-## TODO
-
-- Fix start on login

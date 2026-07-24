@@ -11,11 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ilammy/msvc-dev-cmd@v1
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
           name: textpander
           path: |
             target/release/textpander.exe
-            config.json
             README.md
