@@ -72,6 +72,17 @@ const APP_UNIQUE_NAME: &str = "Textpander_Alfakynz";
 /// recognize it (in wndproc of the already-running instance).
 static WAKE_MSG: AtomicU32 = AtomicU32::new(0);
 
+/// Value returned by RegisterWindowMessageW(L"TaskbarCreated"). Windows
+/// broadcasts this to every top-level window whenever Explorer (re)starts -
+/// notably after it crashes, is manually restarted, or updates - because
+/// doing so silently wipes every process's tray icon with no other
+/// notification. Any app that wants its icon to survive an Explorer
+/// restart must listen for this message and call
+/// Shell_NotifyIconW(NIM_ADD, ...) again when it arrives. Without this,
+/// the tray icon appears to vanish "at random" even though the app (hook,
+/// message loop, etc.) is still running perfectly fine in the background.
+static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+
 /// Remembers the most recent expansion so a Backspace pressed immediately
 /// afterward can undo it (restoring exactly what was typed).
 struct LastExpansion {
@@ -435,9 +446,8 @@ fn set_start_on_login(enabled: bool) {
 /// when you click "Enable" on a startup item.
 fn set_startup_approved(enabled: bool) {
     unsafe {
-        let subkey = to_wide(
-            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run",
-        );
+        let subkey =
+            to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
         let mut hkey: HKEY = null_mut();
         let status = RegCreateKeyExW(
             HKEY_CURRENT_USER,
@@ -506,6 +516,14 @@ pub fn run() {
         let wake_message_name = to_wide(&format!("{}_WakeMessage", APP_UNIQUE_NAME));
         let wake_msg = RegisterWindowMessageW(wake_message_name.as_ptr());
         WAKE_MSG.store(wake_msg, Ordering::SeqCst);
+
+        // Listen for Explorer restarts (see the doc comment on
+        // TASKBAR_CREATED_MSG): this is what lets the tray icon come back
+        // automatically after explorer.exe crashes or is restarted,
+        // instead of silently staying gone until the next manual relaunch.
+        let taskbar_created_name = to_wide("TaskbarCreated");
+        let taskbar_created_msg = RegisterWindowMessageW(taskbar_created_name.as_ptr());
+        TASKBAR_CREATED_MSG.store(taskbar_created_msg, Ordering::SeqCst);
 
         if already_running {
             let existing = FindWindowW(class_name.as_ptr(), null_mut());
@@ -625,6 +643,23 @@ unsafe extern "system" fn wndproc(
         // Another launch of the app happened while we're already running:
         // this is our cue to re-show the tray icon if it was hidden.
         show_tray_icon();
+        return 0;
+    }
+
+    if msg == TASKBAR_CREATED_MSG.load(Ordering::SeqCst) && msg != 0 {
+        // Explorer just (re)started, which silently wiped every tray icon
+        // on the system, ours included, without otherwise telling us. Only
+        // re-add it if the user actually wants it visible - don't
+        // resurrect an icon they deliberately hid via "Hide tray".
+        let should_show = STATE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.tray_visible)
+            .unwrap_or(true);
+        if should_show {
+            show_tray_icon();
+        }
         return 0;
     }
 
