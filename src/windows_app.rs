@@ -57,6 +57,7 @@ const ID_TOGGLE_STARTUP: usize = 1007;
 const ID_ABOUT: usize = 1008;
 const TRAY_ID: u32 = 1;
 const MAX_BUFFER_LEN: usize = 64;
+const TRAY_WATCHDOG_TIMER: usize = 1;
 
 /// Change this to point at wherever you want the About dialog's link to go
 /// (a GitHub repo, a personal site, etc).
@@ -82,6 +83,9 @@ static WAKE_MSG: AtomicU32 = AtomicU32::new(0);
 /// the tray icon appears to vanish "at random" even though the app (hook,
 /// message loop, etc.) is still running perfectly fine in the background.
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+
+/// Not exposed by winapi 0.3 (Win32 value for ChangeWindowMessageFilterEx).
+const MSGFLT_ALLOW: u32 = 1;
 
 /// Remembers the most recent expansion so a Backspace pressed immediately
 /// afterward can undo it (restoring exactly what was typed).
@@ -567,17 +571,24 @@ pub fn run() {
 
         let window_title = to_wide("Textpander");
         let hwnd = CreateWindowExW(
-            0,
+            winapi::um::winuser::WS_EX_TOOLWINDOW,
             class_name.as_ptr(),
             window_title.as_ptr(),
+            winapi::um::winuser::WS_POPUP,
             0,
             0,
             0,
             0,
-            0,
-            winapi::um::winuser::HWND_MESSAGE, // message-only window: invisible, no taskbar entry
+            null_mut(),
             null_mut(),
             hinstance,
+            null_mut(),
+        );
+
+        winapi::um::winuser::ChangeWindowMessageFilterEx(
+            hwnd,
+            taskbar_created_msg,
+            MSGFLT_ALLOW,
             null_mut(),
         );
 
@@ -614,6 +625,7 @@ pub fn run() {
         });
         if settings.show_tray_icon {
             show_tray_icon();
+            winapi::um::winuser::SetTimer(hwnd, TRAY_WATCHDOG_TIMER, 3000, None);
         }
 
         // Global low-level keyboard hook. Must run on a thread with an
@@ -700,6 +712,10 @@ unsafe extern "system" fn wndproc(
                 }
                 _ => {}
             }
+            0
+        }
+        winapi::um::winuser::WM_TIMER if wparam == TRAY_WATCHDOG_TIMER => {
+            ensure_tray_icon();
             0
         }
         WM_DESTROY => {
@@ -826,6 +842,39 @@ fn show_tray_icon() {
     if let Some(state) = STATE.lock().unwrap().as_mut() {
         state.tray_visible = true;
         persist_settings(state);
+    }
+}
+
+/// Watchdog: if the tray icon is supposed to be visible but the shell no
+/// longer knows about it (Explorer restarted, NIM_ADD raced with tray
+/// startup, ...), add it again. NIM_MODIFY fails when the icon is missing.
+fn ensure_tray_icon() {
+    let wanted = STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.tray_visible)
+        .unwrap_or(false);
+    if !wanted {
+        return;
+    }
+
+    let exists = {
+        let tray_guard = TRAY.lock().unwrap();
+        match tray_guard.as_ref() {
+            Some(tray) => unsafe {
+                let mut nid: NOTIFYICONDATAW = zeroed();
+                nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+                nid.hWnd = tray.hwnd;
+                nid.uID = TRAY_ID;
+                Shell_NotifyIconW(winapi::um::shellapi::NIM_MODIFY, &mut nid) != 0
+            },
+            None => return,
+        }
+    };
+
+    if !exists {
+        show_tray_icon();
     }
 }
 
