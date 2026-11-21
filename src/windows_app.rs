@@ -2,6 +2,13 @@
 // All Win32 interop lives in this file. The pure expansion logic (case
 // matching, config parsing) lives in logic.rs and has no dependency on
 // Windows, so it can be unit-tested on any platform.
+//
+// Threading model: everything here runs on ONE thread (the one that owns the
+// message loop). The low-level hooks are called back on that same thread, so
+// STATE is never contended, but it is NOT re-entrant: never hold the STATE
+// lock while calling something that can pump messages (MessageBox,
+// ShellExecute, TrackPopupMenu...). A hook would fire inside that nested
+// loop, try to lock STATE again and deadlock the whole app.
 
 use crate::logic;
 use serde::{Deserialize, Serialize};
@@ -9,21 +16,22 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
-use std::mem::{size_of, zeroed};
+use std::mem::{self, size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use winapi::shared::minwindef::{HINSTANCE, HKEY, LPARAM, LRESULT, UINT, WPARAM};
-use winapi::shared::windef::{HHOOK, HICON, HWND, POINT};
+use winapi::shared::windef::{HHOOK, HICON, HMENU, HWND, POINT};
 use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
 use winapi::um::errhandlingapi::GetLastError;
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::shellapi::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW,
+    NIM_MODIFY, NOTIFYICONDATAW,
 };
 use winapi::um::synchapi::CreateMutexW;
 use winapi::um::winnt::{KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE, REG_SZ};
@@ -31,19 +39,22 @@ use winapi::um::winreg::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY_CURRENT_USER,
 };
 use winapi::um::winuser::{
-    AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, FindWindowW, GetAsyncKeyState, GetCursorPos, GetForegroundWindow,
-    GetKeyState, GetKeyboardLayout, GetMessageW, GetSystemMetrics, GetWindowThreadProcessId,
-    LoadIconW, LoadImageW, MapVirtualKeyExW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SendInput, SetForegroundWindow, SetWindowsHookExW, ToUnicodeEx,
-    TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, HC_ACTION, IDI_APPLICATION, IMAGE_ICON,
-    INPUT, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    LLKHF_INJECTED, LR_DEFAULTSIZE, MAPVK_VK_TO_CHAR, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, MSG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
-    VK_BACK, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
-    VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, WH_KEYBOARD_LL, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP, WM_RBUTTONUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WNDCLASSW,
+    AppendMenuW, CallNextHookEx, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetAsyncKeyState,
+    GetCursorPos, GetForegroundWindow, GetKeyState, GetKeyboardLayout, GetMessageW,
+    GetSystemMetrics, GetWindowThreadProcessId, LoadIconW, LoadImageW, MapVirtualKeyExW,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendInput,
+    SetForegroundWindow, SetTimer, SetWindowsHookExW, ToUnicodeEx, TrackPopupMenu,
+    TranslateMessage, UnhookWindowsHookEx, HC_ACTION, IDI_APPLICATION, IMAGE_ICON, INPUT,
+    INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    LLKHF_INJECTED, LR_DEFAULTSIZE, MAPVK_VK_TO_CHAR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SM_CXSMICON, SM_CYSMICON,
+    SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, VK_BACK, VK_CAPITAL,
+    VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN,
+    VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_APP,
+    WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_NULL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const WM_TRAYICON: UINT = WM_APP + 1;
@@ -56,137 +67,149 @@ const ID_OPEN_SETTINGS: usize = 1006;
 const ID_TOGGLE_STARTUP: usize = 1007;
 const ID_ABOUT: usize = 1008;
 const TRAY_ID: u32 = 1;
-const MAX_BUFFER_LEN: usize = 64;
 const TRAY_WATCHDOG_TIMER: usize = 1;
-
-/// Change this to point at wherever you want the About dialog's link to go
-/// (a GitHub repo, a personal site, etc).
-const ABOUT_URL: &str = "https://github.com/Alfakynz/Textpander";
-
-/// A name used both for the single-instance mutex and as the base for the
-/// registered "wake up and show your tray icon again" window message.
-/// Kept fairly unique to avoid colliding with unrelated apps.
-const APP_UNIQUE_NAME: &str = "Textpander_Alfakynz";
-
-/// Value returned by RegisterWindowMessageW, computed once at startup and
-/// used both to post the message (from a second launched instance) and to
-/// recognize it (in wndproc of the already-running instance).
-static WAKE_MSG: AtomicU32 = AtomicU32::new(0);
-
-/// Value returned by RegisterWindowMessageW(L"TaskbarCreated"). Windows
-/// broadcasts this to every top-level window whenever Explorer (re)starts -
-/// notably after it crashes, is manually restarted, or updates - because
-/// doing so silently wipes every process's tray icon with no other
-/// notification. Any app that wants its icon to survive an Explorer
-/// restart must listen for this message and call
-/// Shell_NotifyIconW(NIM_ADD, ...) again when it arrives. Without this,
-/// the tray icon appears to vanish "at random" even though the app (hook,
-/// message loop, etc.) is still running perfectly fine in the background.
-static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+const MAX_BUFFER_LEN: usize = 64;
 
 /// Not exposed by winapi 0.3 (Win32 value for ChangeWindowMessageFilterEx).
 const MSGFLT_ALLOW: u32 = 1;
 
+const ABOUT_URL: &str = "https://github.com/Alfakynz/Textpander";
+
+/// Base for the single-instance mutex, the registered "wake up" window
+/// message and the registry value name. Kept unique to avoid collisions.
+const APP_UNIQUE_NAME: &str = "Textpander_Alfakynz";
+
+const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const STARTUP_APPROVED_KEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+
+/// Window message posted by a second launch to the running instance, so it
+/// re-shows its tray icon (and then the second launch exits).
+static WAKE_MSG: AtomicU32 = AtomicU32::new(0);
+
+/// "TaskbarCreated": broadcast by Windows whenever Explorer (re)starts. An
+/// Explorer restart silently wipes every tray icon, so we must re-add ours
+/// when this arrives.
+static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
 /// Remembers the most recent expansion so a Backspace pressed immediately
-/// afterward can undo it (restoring exactly what was typed).
+/// afterwards can undo it (restoring exactly what was typed).
 struct LastExpansion {
     typed: String,
-    expansion: String,
+    /// Number of Backspaces needed to erase the expansion + its boundary key.
+    delete_len: usize,
 }
 
 struct AppState {
     config: HashMap<String, String>,
     replacements_path: PathBuf,
     settings_path: PathBuf,
+    /// Characters that trigger an expansion attempt (Enter and Tab always do).
+    boundary_chars: Vec<char>,
+    enabled: bool,
+    tray_visible: bool,
+    start_on_login: bool,
+    /// See `AppSettings::clear_autocomplete`.
+    clear_autocomplete: bool,
+
+    // Win32 handles, stored as integers so the struct is naturally `Send`
+    // (they are only ever used from the single UI thread).
+    hwnd: usize,
+    tray_icon: usize,
+
+    // --- typing tracking (see `reset_typing`) ---
     buffer: String,
     last_expansion: Option<LastExpansion>,
-    /// Characters that trigger an expansion attempt when typed (in addition
-    /// to Enter and Tab, which always do). Configurable via the
-    /// "characters" array in config.json, e.g. [" ", ",", ")"].
-    boundary_chars: Vec<char>,
-    /// Set right after an undo, so that hitting the boundary key again
-    /// immediately (without typing any more letters) does not silently
-    /// re-expand the same occurrence. Cleared as soon as a letter is typed
-    /// (that means the word is being actively edited again) or after the
-    /// next boundary key is processed (one-shot).
+    /// Set right after an undo so the next boundary key doesn't immediately
+    /// re-expand the same occurrence. One-shot.
     suppress_expansion: bool,
-    /// When we swallow a keydown ourselves (a boundary key we're replacing,
-    /// or the undo Backspace), we must also swallow its matching keyup so
-    /// the target app doesn't see an orphaned key-up event.
-    suppress_next_keyup: Option<i32>,
-    /// The word just finished by a boundary key (space/enter/tab) that did
-    /// *not* match any abbreviation. Kept for exactly one Backspace: if the
-    /// very next key is Backspace (deleting that boundary character), the
-    /// buffer is restored to this word so correcting a typo - e.g. typing
-    /// "bjt", noticing the mistake, backspacing over the space and the "t",
-    /// then typing "r" - still gets tracked as "bjr" and can expand.
-    /// Cleared by any other key, so it never resurrects a long-abandoned
-    /// word.
+    /// The word finished by a boundary key that matched nothing. Kept for
+    /// exactly one Backspace so that fixing a typo ("bjt" + space, then
+    /// backspace x2, then "r") still ends up tracked as "bjr".
     pending_word: Option<String>,
-    /// Set when the previous key was a dead key (an accent waiting to
-    /// combine, e.g. "^", or "~" typed via AltGr). The *next* key must
-    /// never be run through ToUnicodeEx either - even though it isn't a
-    /// dead key itself, calling ToUnicodeEx on it would consume the
-    /// composition the target app is still waiting to finish, breaking the
-    /// accent there too. So this next key is treated as unknown (buffer
-    /// reset) and left completely untouched, letting the target app
-    /// compose the accent on its own.
+    /// Set after a dead key (accent waiting to combine). The *next* key must
+    /// not go through ToUnicodeEx either, or it would consume the pending
+    /// composition the target app is still waiting to finish.
     skip_next_char_resolution: bool,
-    /// When false, the hook only ever passes keys through untouched - no
-    /// buffer tracking, no expansion, no undo.
-    enabled: bool,
-    /// Whether the tray icon is currently shown. Purely informational for
-    /// the menu label; the actual add/remove happens via show_tray_icon /
-    /// hide_tray_icon. Persisted to config.json as `show_tray_icon`.
-    tray_visible: bool,
-    /// Whether Textpander is registered to launch when the user logs in.
-    /// Kept in sync with the HKCU Run registry key and persisted to
-    /// config.json as `start_on_login`.
-    start_on_login: bool,
+
+    /// When we swallow a keydown ourselves we must swallow its keyup too.
+    suppress_next_keyup: Option<i32>,
+    /// Last foreground window seen by the hook. A change means the user
+    /// moved elsewhere, so any half-typed word is stale.
+    last_foreground: usize,
+}
+
+impl AppState {
+    /// Forgets any in-progress word / undo / dead-key context.
+    fn reset_typing(&mut self) {
+        self.buffer.clear();
+        self.last_expansion = None;
+        self.suppress_expansion = false;
+        self.pending_word = None;
+        self.skip_next_char_resolution = false;
+    }
 }
 
 static STATE: Mutex<Option<AppState>> = Mutex::new(None);
 
-/// Handles needed to add/remove the tray icon on demand (e.g. hide it from
-/// the menu, then bring it back later by relaunching the exe). Kept
-/// separate from AppState because these are raw Win32 handles rather than
-/// plain owned data.
-struct TrayResources {
-    hwnd: HWND,
-    icon: HICON,
+/// Locks STATE, ignoring poisoning (a panic elsewhere must not turn every
+/// later keystroke into another panic inside an `extern "system"` callback).
+fn lock_state() -> MutexGuard<'static, Option<AppState>> {
+    STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
-// SAFETY: HWND/HICON are just handle values (effectively integers/opaque
-// pointers understood by the OS). They're only ever touched from this
-// process's single UI/hook thread, guarded by the Mutex below.
-unsafe impl Send for TrayResources {}
 
-static TRAY: Mutex<Option<TrayResources>> = Mutex::new(None);
+fn with_state<R>(f: impl FnOnce(&mut AppState) -> R) -> Option<R> {
+    lock_state().as_mut().map(f)
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+fn to_wide_os(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
 
 fn to_wide(s: &str) -> Vec<u16> {
-    OsStr::new(s)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
+    to_wide_os(OsStr::new(s))
 }
 
-/// Equivalent of the Win32 MAKEINTRESOURCEW macro: turns a numeric resource
-/// ID into the special pointer value LoadIconW (and friends) expect when
-/// you want "resource by ID" rather than "resource by name string".
+/// Equivalent of the Win32 MAKEINTRESOURCEW macro.
 fn make_int_resource(id: u16) -> *const u16 {
     id as usize as *const u16
 }
 
-/// Loads our embedded icon (resource ID 1, see app.rc) at a specific size.
-/// Pass cx = cy = 0 to get the system's default icon size instead.
-///
-/// LoadImageW is used rather than the older LoadIconW: it's the API
-/// Microsoft recommends for loading icons from resources (LoadIconW is kept
-/// only for backwards compatibility and can be finicky with modern .ico
-/// files that include a PNG-compressed 256x256 frame), and it lets us ask
-/// for the exact size the tray actually wants instead of a default that may
-/// not match. Falls back to LoadIconW, then to the generic Windows icon, if
-/// anything goes wrong - so a build/resource hiccup never crashes the app,
-/// it just looks like the plain default icon.
+fn message_box(title: &str, text: &str, icon: UINT) {
+    let (wtitle, wtext) = (to_wide(title), to_wide(text));
+    unsafe {
+        MessageBoxW(null_mut(), wtext.as_ptr(), wtitle.as_ptr(), MB_OK | icon);
+    }
+}
+
+fn show_message(text: &str) {
+    message_box("Textpander", text, MB_ICONWARNING);
+}
+
+fn show_about_window() {
+    let text = format!(
+        "Textpander {}\n\nMade by Alfakynz.\n\n{}",
+        env!("CARGO_PKG_VERSION"),
+        ABOUT_URL
+    );
+    message_box("About Textpander", &text, MB_ICONINFORMATION);
+}
+
+fn is_down(vk: i32) -> bool {
+    unsafe { (GetAsyncKeyState(vk) as u16 & 0x8000) != 0 }
+}
+
+/// Loads our embedded icon (resource ID 1, see app.rc) at a given size
+/// (0, 0 = system default size). Falls back to LoadIconW, then to the
+/// generic Windows icon, so a resource hiccup never crashes the app.
 fn load_app_icon(hinstance: HINSTANCE, cx: i32, cy: i32) -> HICON {
     unsafe {
         let flags = if cx == 0 && cy == 0 {
@@ -198,20 +221,40 @@ fn load_app_icon(hinstance: HINSTANCE, cx: i32, cy: i32) -> HICON {
         if !handle.is_null() {
             return handle as HICON;
         }
-
         let fallback = LoadIconW(hinstance, make_int_resource(1));
         if !fallback.is_null() {
             return fallback;
         }
-
         LoadIconW(null_mut(), IDI_APPLICATION)
     }
 }
 
-/// Root folder for all Textpander config files: `%APPDATA%\Textpander`.
-/// Falls back to the folder next to the executable if APPDATA isn't set
-/// (unusual on Windows, but keeps the app working rather than crashing).
-/// Created on demand if it doesn't exist yet.
+/// Opens a file with its default app, falling back to Notepad when no
+/// association exists for it.
+fn open_in_default_app(path: &Path) {
+    let (op, wpath) = (to_wide("open"), to_wide_os(path.as_os_str()));
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            op.as_ptr(),
+            wpath.as_ptr(),
+            null_mut(),
+            null_mut(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecute returns a value <= 32 on failure.
+    if (result as isize) <= 32 {
+        let _ = Command::new("notepad").arg(path).spawn();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config files
+// ---------------------------------------------------------------------------
+
+/// `%APPDATA%\Textpander` (next to the exe if APPDATA is missing), created
+/// on demand.
 fn app_data_dir() -> PathBuf {
     let base = env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -225,17 +268,6 @@ fn app_data_dir() -> PathBuf {
     dir
 }
 
-/// Abbreviation -> expansion pairs. Formerly named config.json; kept as
-/// separate concern from the app-level settings in config.json below.
-fn replacements_path() -> PathBuf {
-    app_data_dir().join("replacements.json")
-}
-
-/// App-level settings (currently just whether replacements start enabled).
-fn settings_path() -> PathBuf {
-    app_data_dir().join("config.json")
-}
-
 const DEFAULT_REPLACEMENTS: &str = r#"{
     "pls": "please",
     "btw": "by the way",
@@ -244,52 +276,35 @@ const DEFAULT_REPLACEMENTS: &str = r#"{
 }
 "#;
 
-fn ensure_replacements_exists(path: &PathBuf) {
-    if !path.exists() {
-        let _ = fs::write(path, DEFAULT_REPLACEMENTS);
-    }
+const DEFAULT_SETTINGS: &str = r#"{
+    "enabled": true,
+    "show_tray_icon": true,
+    "start_on_login": false,
+    "clear_autocomplete": true,
+    "characters": [" ", ",", ".", ";", ":", "!", "?", ")", "\"", "\n"]
 }
-
-fn load_replacements(path: &PathBuf) -> HashMap<String, String> {
-    ensure_replacements_exists(path);
-    match fs::read_to_string(path) {
-        Ok(text) => match logic::load_config_map(&text) {
-            Ok(map) => map,
-            Err(e) => {
-                show_message(&format!(
-                    "replacements.json is not valid JSON:\n{}\n\nNo abbreviations were loaded until this is fixed.",
-                    e
-                ));
-                HashMap::new()
-            }
-        },
-        Err(e) => {
-            show_message(&format!("Could not read replacements.json:\n{}", e));
-            HashMap::new()
-        }
-    }
-}
+"#;
 
 /// App-level settings, persisted to config.json (separate from the
 /// abbreviation list in replacements.json).
 #[derive(Debug, Serialize, Deserialize)]
 struct AppSettings {
-    /// Whether replacements are active on startup. Kept in sync with the
-    /// tray "Enable/Disable replacements" toggle.
     #[serde(default = "default_true")]
     enabled: bool,
-    /// Whether the tray icon is shown on startup. Kept in sync with the
-    /// tray "Hide tray" action (and relaunching the exe to bring it back).
     #[serde(default = "default_true")]
     show_tray_icon: bool,
-    /// Whether Textpander launches automatically when the user logs in.
-    /// Kept in sync with the tray "Start on login" toggle.
     #[serde(default)]
     start_on_login: bool,
-    /// Characters that trigger an expansion attempt when typed, e.g.
-    /// [" ", ",", ")"]. Enter and Tab always trigger one regardless of
-    /// this list. Each entry should be a single character; longer strings
-    /// are ignored (only the first character is used).
+    /// Browser address bars (and similar fields) inline-autocomplete as you
+    /// type: after "ca" they may show "ca" + a *selected* suggestion. The
+    /// first Backspace then deletes that suggestion instead of a letter, and
+    /// the expansion ends up with a leftover character ("cça"). When true,
+    /// a throw-away character is typed first so any selection is replaced,
+    /// then deleted along with the abbreviation. Set to false to disable.
+    #[serde(default = "default_true")]
+    clear_autocomplete: bool,
+    /// Characters that trigger an expansion attempt, e.g. [" ", ",", ")"].
+    /// Only the first character of each entry is used.
     #[serde(default = "default_boundary_characters")]
     characters: Vec<String>,
 }
@@ -308,14 +323,12 @@ impl Default for AppSettings {
             enabled: true,
             show_tray_icon: true,
             start_on_login: false,
+            clear_autocomplete: true,
             characters: default_boundary_characters(),
         }
     }
 }
 
-/// Converts the "characters" JSON string list into actual chars for fast
-/// lookup while typing. Empty strings are skipped; only the first
-/// character of any multi-character entry is used.
 fn boundary_chars_from_settings(settings: &AppSettings) -> Vec<char> {
     settings
         .characters
@@ -324,236 +337,172 @@ fn boundary_chars_from_settings(settings: &AppSettings) -> Vec<char> {
         .collect()
 }
 
-const DEFAULT_SETTINGS: &str = r#"{
-    "enabled": true,
-    "show_tray_icon": true,
-    "start_on_login": false,
-    "characters": [" ", ",", ".", ";", ":", "!", "?", ")", "\"", "\n"]
-}
-"#;
-
-fn ensure_settings_exists(path: &PathBuf) {
+/// Reads a config file (creating it with defaults if missing) and strips a
+/// UTF-8 BOM, which some editors add and serde_json would reject.
+fn read_or_create(path: &Path, default: &str, name: &str) -> Result<String, String> {
     if !path.exists() {
-        let _ = fs::write(path, DEFAULT_SETTINGS);
+        let _ = fs::write(path, default);
     }
+    fs::read_to_string(path)
+        .map(|t| t.trim_start_matches('\u{feff}').to_owned())
+        .map_err(|e| format!("Could not read {name}:\n{e}"))
 }
 
-fn load_settings(path: &PathBuf) -> AppSettings {
-    ensure_settings_exists(path);
-    match fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str(&text) {
-            Ok(settings) => settings,
-            Err(e) => {
-                show_message(&format!(
-                    "config.json is not valid JSON:\n{}\n\nUsing default settings until this is fixed.",
-                    e
-                ));
-                AppSettings::default()
-            }
-        },
-        Err(e) => {
-            show_message(&format!("Could not read config.json:\n{}", e));
-            AppSettings::default()
-        }
-    }
+fn load_replacements(path: &Path) -> Result<HashMap<String, String>, String> {
+    let text = read_or_create(path, DEFAULT_REPLACEMENTS, "replacements.json")?;
+    logic::load_config_map(&text).map_err(|e| format!("replacements.json is not valid JSON:\n{e}"))
 }
 
-fn save_settings(path: &PathBuf, settings: &AppSettings) {
-    if let Ok(text) = serde_json::to_string_pretty(settings) {
-        let _ = fs::write(path, text);
-    }
+fn load_settings(path: &Path) -> Result<AppSettings, String> {
+    let text = read_or_create(path, DEFAULT_SETTINGS, "config.json")?;
+    serde_json::from_str(&text).map_err(|e| format!("config.json is not valid JSON:\n{e}"))
 }
 
-/// Rebuilds the full AppSettings from the live AppState and writes it out.
-/// Used whenever any individual persisted setting changes, so we never
-/// clobber the other fields with stale/default values.
+/// Writes through a temp file + rename so a crash mid-write can never leave
+/// a truncated config.json behind.
 fn persist_settings(state: &AppState) {
     let settings = AppSettings {
         enabled: state.enabled,
         show_tray_icon: state.tray_visible,
         start_on_login: state.start_on_login,
+        clear_autocomplete: state.clear_autocomplete,
         characters: state.boundary_chars.iter().map(|c| c.to_string()).collect(),
     };
-    save_settings(&state.settings_path, &settings);
+    let Ok(text) = serde_json::to_string_pretty(&settings) else {
+        return;
+    };
+    let tmp = state.settings_path.with_extension("json.tmp");
+    if fs::write(&tmp, text).is_err() || fs::rename(&tmp, &state.settings_path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
 }
 
-/// Adds or removes the HKCU ...\Run value that makes Windows launch
-/// Textpander automatically at login. Best-effort: failures (e.g. no
-/// permission, though HKCU normally doesn't need any) are silently
-/// ignored rather than shown as a message box, since this isn't critical
-/// to the app's core function.
-fn set_start_on_login(enabled: bool) {
-    unsafe {
-        let subkey = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+// ---------------------------------------------------------------------------
+// Start on login (registry)
+// ---------------------------------------------------------------------------
+
+/// Minimal RAII wrapper around an open HKCU registry key.
+struct RegKey(HKEY);
+
+impl RegKey {
+    fn open(subkey: &str) -> Option<Self> {
+        let subkey = to_wide(subkey);
         let mut hkey: HKEY = null_mut();
-        let status = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            null_mut(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            null_mut(),
-            &mut hkey,
-            null_mut(),
-        );
-        if status != 0 || hkey.is_null() {
-            return;
-        }
-
-        let value_name = to_wide(APP_UNIQUE_NAME);
-        if enabled {
-            if let Ok(exe_path) = env::current_exe() {
-                // Quoted so the launch command stays correct even if the
-                // install path contains spaces.
-                let quoted = format!("\"{}\"", exe_path.to_string_lossy());
-                let data = to_wide(&quoted);
-                let data_len_bytes = (data.len() * size_of::<u16>()) as u32;
-                RegSetValueExW(
-                    hkey,
-                    value_name.as_ptr(),
-                    0,
-                    REG_SZ,
-                    data.as_ptr() as *const u8,
-                    data_len_bytes,
-                );
-            }
-        } else {
-            // Fine if the value doesn't exist yet - just a no-op.
-            RegDeleteValueW(hkey, value_name.as_ptr());
-        }
-
-        RegCloseKey(hkey);
+        let status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                null_mut(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE,
+                null_mut(),
+                &mut hkey,
+                null_mut(),
+            )
+        };
+        (status == 0 && !hkey.is_null()).then_some(RegKey(hkey))
     }
 
-    // The Run key alone controls whether an entry *exists*, but Windows
-    // separately tracks whether it's actually *approved* to run (this is
-    // what Task Manager's Startup tab and Settings > Apps > Startup show
-    // and let you toggle). A Run entry added directly to the registry
-    // (rather than by an installer) can end up shown there switched off,
-    // in which case Windows silently skips it at login even though the
-    // Run value is present. Explicitly writing the "approved" state here
-    // avoids depending on that separate, semi-undocumented mechanism
-    // defaulting the right way on its own.
-    set_startup_approved(enabled);
-}
-
-/// Writes (or removes) the corresponding entry under
-/// ...\Explorer\StartupApproved\Run, which is what actually gates whether
-/// Windows executes a Run-key entry at login (see set_start_on_login).
-/// The 12-byte enabled/disabled encoding here isn't formally documented by
-/// Microsoft, but is well established from reverse-engineering by the
-/// Windows forensics community: byte 0 = 0x02 means enabled (the remaining
-/// 11 bytes are unused/zero for that state); anything else, notably 0x03,
-/// means disabled (with a FILETIME of when it was disabled in the
-/// remaining bytes). This is also exactly what Task Manager itself writes
-/// when you click "Enable" on a startup item.
-fn set_startup_approved(enabled: bool) {
-    unsafe {
-        let subkey =
-            to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
-        let mut hkey: HKEY = null_mut();
-        let status = RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            null_mut(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            null_mut(),
-            &mut hkey,
-            null_mut(),
-        );
-        if status != 0 || hkey.is_null() {
-            return;
-        }
-
-        let value_name = to_wide(APP_UNIQUE_NAME);
-        if enabled {
-            let data: [u8; 12] = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    fn set(&self, name: &str, kind: u32, data: &[u8]) {
+        let name = to_wide(name);
+        unsafe {
             RegSetValueExW(
-                hkey,
-                value_name.as_ptr(),
+                self.0,
+                name.as_ptr(),
                 0,
-                REG_BINARY,
+                kind,
                 data.as_ptr(),
                 data.len() as u32,
             );
-        } else {
-            // Not strictly required (Windows only consults this when the
-            // Run entry also exists, which we've just removed), but keeps
-            // the registry tidy rather than leaving a stale approval entry
-            // behind.
-            RegDeleteValueW(hkey, value_name.as_ptr());
         }
+    }
 
-        RegCloseKey(hkey);
+    /// Fine if the value doesn't exist: it's just a no-op.
+    fn delete(&self, name: &str) {
+        let name = to_wide(name);
+        unsafe {
+            RegDeleteValueW(self.0, name.as_ptr());
+        }
     }
 }
 
-fn show_message(text: &str) {
-    unsafe {
-        let wtext = to_wide(text);
-        let wtitle = to_wide("Textpander");
-        winapi::um::winuser::MessageBoxW(
-            null_mut(),
-            wtext.as_ptr(),
-            wtitle.as_ptr(),
-            winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONWARNING,
-        );
+impl Drop for RegKey {
+    fn drop(&mut self) {
+        unsafe {
+            RegCloseKey(self.0);
+        }
     }
 }
 
-/// Entry point, called from main() on Windows.
+/// Adds/removes the HKCU Run value that launches Textpander at login, and
+/// keeps the matching "StartupApproved" entry in sync. That second entry is
+/// what Task Manager's Startup tab toggles; without an explicit "enabled"
+/// value, Windows can silently skip a Run entry added by hand. (Its 12-byte
+/// format - first byte 0x02 = enabled - is undocumented but well known.)
+/// Best-effort: failures are ignored, this isn't critical to the core feature.
+fn set_start_on_login(enabled: bool) {
+    if let Some(run) = RegKey::open(RUN_KEY) {
+        if !enabled {
+            run.delete(APP_UNIQUE_NAME);
+        } else if let Ok(exe) = env::current_exe() {
+            // Quoted so paths containing spaces still work.
+            let command = format!("\"{}\"", exe.to_string_lossy());
+            let bytes: Vec<u8> = to_wide(&command)
+                .iter()
+                .flat_map(|u| u.to_le_bytes())
+                .collect();
+            run.set(APP_UNIQUE_NAME, REG_SZ, &bytes);
+        }
+    }
+    if let Some(approved) = RegKey::open(STARTUP_APPROVED_KEY) {
+        if enabled {
+            approved.set(
+                APP_UNIQUE_NAME,
+                REG_BINARY,
+                &[0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            );
+        } else {
+            approved.delete(APP_UNIQUE_NAME);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point + window procedure
+// ---------------------------------------------------------------------------
+
 pub fn run() {
     unsafe {
-        // --- Single-instance handling -----------------------------------
-        // If an instance is already running, this launch's only job is to
-        // wake it up (in case its tray icon was hidden) and then exit
-        // immediately, so we never end up with two competing keyboard
-        // hooks double-typing everything.
+        // Single instance: a second launch only wakes the first one (so a
+        // hidden tray icon comes back) and exits, so two competing keyboard
+        // hooks never double-type everything. The mutex handle is never
+        // closed on purpose: it must live as long as this process.
         let mutex_name = to_wide(&format!("Local\\{}_Mutex", APP_UNIQUE_NAME));
         let mutex_handle = CreateMutexW(null_mut(), 0, mutex_name.as_ptr());
         let already_running = !mutex_handle.is_null() && GetLastError() == ERROR_ALREADY_EXISTS;
 
         let class_name = to_wide("TextpanderHiddenWindowClass");
-        let wake_message_name = to_wide(&format!("{}_WakeMessage", APP_UNIQUE_NAME));
-        let wake_msg = RegisterWindowMessageW(wake_message_name.as_ptr());
+        let wake_msg =
+            RegisterWindowMessageW(to_wide(&format!("{}_WakeMessage", APP_UNIQUE_NAME)).as_ptr());
         WAKE_MSG.store(wake_msg, Ordering::SeqCst);
-
-        // Listen for Explorer restarts (see the doc comment on
-        // TASKBAR_CREATED_MSG): this is what lets the tray icon come back
-        // automatically after explorer.exe crashes or is restarted,
-        // instead of silently staying gone until the next manual relaunch.
-        let taskbar_created_name = to_wide("TaskbarCreated");
-        let taskbar_created_msg = RegisterWindowMessageW(taskbar_created_name.as_ptr());
+        let taskbar_created_msg = RegisterWindowMessageW(to_wide("TaskbarCreated").as_ptr());
         TASKBAR_CREATED_MSG.store(taskbar_created_msg, Ordering::SeqCst);
 
         if already_running {
             let existing = FindWindowW(class_name.as_ptr(), null_mut());
             if !existing.is_null() {
-                winapi::um::winuser::PostMessageW(existing, wake_msg, 0, 0);
+                PostMessageW(existing, wake_msg, 0, 0);
             }
-            // Deliberately not calling CloseHandle(mutex_handle) or doing
-            // any further setup - this process's only job here is done.
             return;
         }
-        // First/only instance: intentionally never close mutex_handle: it
-        // needs to stay held for as long as this process is running, so
-        // later launches can detect us. It's released automatically by
-        // Windows when the process exits.
 
         let hinstance = GetModuleHandleW(null_mut());
-
-        // Resource ID 1, embedded via app.rc / build.rs from assets/icon.ico.
-        // The tray wants a small icon (SM_CXSMICON, usually 16x16); the
-        // window class can use the default/large size.
         let small_icon = load_app_icon(
             hinstance,
             GetSystemMetrics(SM_CXSMICON),
             GetSystemMetrics(SM_CYSMICON),
         );
-        let large_icon = load_app_icon(hinstance, 0, 0);
 
         let wnd_class = WNDCLASSW {
             style: 0,
@@ -561,7 +510,7 @@ pub fn run() {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
-            hIcon: large_icon,
+            hIcon: load_app_icon(hinstance, 0, 0),
             hCursor: null_mut(),
             hbrBackground: null_mut(),
             lpszMenuName: null_mut(),
@@ -569,12 +518,11 @@ pub fn run() {
         };
         RegisterClassW(&wnd_class);
 
-        let window_title = to_wide("Textpander");
         let hwnd = CreateWindowExW(
-            winapi::um::winuser::WS_EX_TOOLWINDOW,
+            WS_EX_TOOLWINDOW,
             class_name.as_ptr(),
-            window_title.as_ptr(),
-            winapi::um::winuser::WS_POPUP,
+            to_wide("Textpander").as_ptr(),
+            WS_POPUP,
             0,
             0,
             0,
@@ -584,53 +532,68 @@ pub fn run() {
             hinstance,
             null_mut(),
         );
+        if hwnd.is_null() {
+            show_message("Could not create the Textpander window.");
+            return;
+        }
+        ChangeWindowMessageFilterEx(hwnd, taskbar_created_msg, MSGFLT_ALLOW, null_mut());
 
-        winapi::um::winuser::ChangeWindowMessageFilterEx(
-            hwnd,
-            taskbar_created_msg,
-            MSGFLT_ALLOW,
-            null_mut(),
-        );
+        // Load everything BEFORE installing the hooks / filling STATE.
+        let replacements_path = app_data_dir().join("replacements.json");
+        let settings_path = app_data_dir().join("config.json");
+        let config = load_replacements(&replacements_path).unwrap_or_else(|e| {
+            show_message(&format!(
+                "{e}\n\nNo abbreviations were loaded until this is fixed."
+            ));
+            HashMap::new()
+        });
+        let settings = load_settings(&settings_path).unwrap_or_else(|e| {
+            show_message(&format!(
+                "{e}\n\nUsing default settings until this is fixed."
+            ));
+            AppSettings::default()
+        });
 
-        let replacements_path = replacements_path();
-        let settings_path = settings_path();
-        let config = load_replacements(&replacements_path);
-        let settings = load_settings(&settings_path);
-        let boundary_chars = boundary_chars_from_settings(&settings);
-
-        // Keep the registry in sync with the persisted preference, in case
-        // it was changed by hand in config.json or the Run key was cleared
-        // by something else since the last launch.
+        // Keep the registry in sync with the persisted preference.
         set_start_on_login(settings.start_on_login);
 
-        *STATE.lock().unwrap() = Some(AppState {
+        *lock_state() = Some(AppState {
             config,
             replacements_path,
             settings_path,
-            buffer: String::new(),
-            last_expansion: None,
-            boundary_chars,
-            suppress_expansion: false,
-            suppress_next_keyup: None,
-            pending_word: None,
-            skip_next_char_resolution: false,
+            boundary_chars: boundary_chars_from_settings(&settings),
             enabled: settings.enabled,
             tray_visible: settings.show_tray_icon,
             start_on_login: settings.start_on_login,
+            clear_autocomplete: settings.clear_autocomplete,
+            hwnd: hwnd as usize,
+            tray_icon: small_icon as usize,
+            buffer: String::new(),
+            last_expansion: None,
+            suppress_expansion: false,
+            pending_word: None,
+            skip_next_char_resolution: false,
+            suppress_next_keyup: None,
+            last_foreground: 0,
         });
 
-        *TRAY.lock().unwrap() = Some(TrayResources {
-            hwnd,
-            icon: small_icon,
-        });
         if settings.show_tray_icon {
-            show_tray_icon();
-            winapi::um::winuser::SetTimer(hwnd, TRAY_WATCHDOG_TIMER, 3000, None);
+            add_tray_icon();
         }
+        // Always running (cheap): re-adds the icon if the shell lost it, and
+        // also covers the case where the icon is un-hidden later.
+        SetTimer(hwnd, TRAY_WATCHDOG_TIMER, 3000, None);
 
-        // Global low-level keyboard hook. Must run on a thread with an
-        // active message loop, which is exactly what we run below.
-        let hook: HHOOK = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), hinstance, 0);
+        // Global low-level hooks; they need the message loop below.
+        let keyboard_hook: HHOOK =
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), hinstance, 0);
+        if keyboard_hook.is_null() {
+            show_message("Could not install the keyboard hook. Textpander will exit.");
+            remove_tray_icon_visual();
+            return;
+        }
+        // Mouse clicks move the caret, so they invalidate the typed word.
+        let mouse_hook: HHOOK = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), hinstance, 0);
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -638,8 +601,9 @@ pub fn run() {
             DispatchMessageW(&msg);
         }
 
-        if !hook.is_null() {
-            UnhookWindowsHookEx(hook);
+        UnhookWindowsHookEx(keyboard_hook);
+        if !mouse_hook.is_null() {
+            UnhookWindowsHookEx(mouse_hook);
         }
         remove_tray_icon_visual();
     }
@@ -651,32 +615,22 @@ unsafe extern "system" fn wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WAKE_MSG.load(Ordering::SeqCst) && msg != 0 {
-        // Another launch of the app happened while we're already running:
-        // this is our cue to re-show the tray icon if it was hidden.
+    if msg != 0 && msg == WAKE_MSG.load(Ordering::SeqCst) {
+        // Another launch happened: bring the tray icon back if it was hidden.
         show_tray_icon();
         return 0;
     }
-
-    if msg == TASKBAR_CREATED_MSG.load(Ordering::SeqCst) && msg != 0 {
-        // Explorer just (re)started, which silently wiped every tray icon
-        // on the system, ours included, without otherwise telling us. Only
-        // re-add it if the user actually wants it visible - don't
-        // resurrect an icon they deliberately hid via "Hide tray".
-        let should_show = STATE
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| s.tray_visible)
-            .unwrap_or(true);
-        if should_show {
-            show_tray_icon();
+    if msg != 0 && msg == TASKBAR_CREATED_MSG.load(Ordering::SeqCst) {
+        // Explorer restarted and wiped our icon. Re-add it, but only if the
+        // user didn't deliberately hide it.
+        if with_state(|s| s.tray_visible).unwrap_or(true) {
+            add_tray_icon();
         }
         return 0;
     }
 
     match msg {
-        m if m == WM_TRAYICON => {
+        WM_TRAYICON => {
             let event = lparam as u32;
             if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
                 show_tray_menu(hwnd);
@@ -684,29 +638,14 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_COMMAND => {
-            let id = (wparam & 0xffff) as usize;
-            match id {
-                ID_RELOAD => {
-                    reload_config();
-                }
-                ID_OPEN_CONFIG => {
-                    open_replacements();
-                }
-                ID_OPEN_SETTINGS => {
-                    open_settings();
-                }
-                ID_TOGGLE_STARTUP => {
-                    toggle_start_on_login();
-                }
-                ID_TOGGLE_ENABLED => {
-                    toggle_enabled();
-                }
-                ID_HIDE_TRAY => {
-                    hide_tray_icon();
-                }
-                ID_ABOUT => {
-                    show_about_window();
-                }
+            match wparam & 0xffff {
+                ID_RELOAD => reload_config(),
+                ID_OPEN_CONFIG => open_config_file(|s| s.replacements_path.clone()),
+                ID_OPEN_SETTINGS => open_config_file(|s| s.settings_path.clone()),
+                ID_TOGGLE_STARTUP => toggle_start_on_login(),
+                ID_TOGGLE_ENABLED => toggle_enabled(),
+                ID_HIDE_TRAY => hide_tray_icon(),
+                ID_ABOUT => show_about_window(),
                 ID_EXIT => {
                     DestroyWindow(hwnd);
                 }
@@ -714,7 +653,7 @@ unsafe extern "system" fn wndproc(
             }
             0
         }
-        winapi::um::winuser::WM_TIMER if wparam == TRAY_WATCHDOG_TIMER => {
+        WM_TIMER if wparam == TRAY_WATCHDOG_TIMER => {
             ensure_tray_icon();
             0
         }
@@ -726,58 +665,48 @@ unsafe extern "system" fn wndproc(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tray icon + menu
+// ---------------------------------------------------------------------------
+
+unsafe fn append_item(menu: HMENU, flags: UINT, id: usize, text: &str) {
+    let wide = to_wide(text);
+    AppendMenuW(menu, flags, id, wide.as_ptr());
+}
+
 unsafe fn show_tray_menu(hwnd: HWND) {
-    let (enabled, _tray_visible, start_on_login) = {
-        let guard = STATE.lock().unwrap();
-        match guard.as_ref() {
-            Some(s) => (s.enabled, s.tray_visible, s.start_on_login),
-            None => (true, true, false),
-        }
-    };
+    let (enabled, start_on_login) =
+        with_state(|s| (s.enabled, s.start_on_login)).unwrap_or((true, false));
 
     let menu = CreatePopupMenu();
-
     let toggle_text = if enabled {
         "Disable replacements"
     } else {
         "Enable replacements"
     };
-    let toggle_label = to_wide(toggle_text);
-    let hide_label = to_wide("Hide tray");
-    let startup_label = to_wide("Start on login");
-    let reload_label = to_wide("Reload app");
-    let open_label = to_wide("Open replacements.json");
-    let open_settings_label = to_wide("Open settings (config.json)");
-    let about_label = to_wide("About");
-    let exit_label = to_wide("Exit");
-
-    AppendMenuW(menu, MF_STRING, ID_TOGGLE_ENABLED, toggle_label.as_ptr());
-    AppendMenuW(menu, MF_STRING, ID_HIDE_TRAY, hide_label.as_ptr());
     let startup_flags = MF_STRING
         | if start_on_login {
             MF_CHECKED
         } else {
             MF_UNCHECKED
         };
-    AppendMenuW(
-        menu,
-        startup_flags,
-        ID_TOGGLE_STARTUP,
-        startup_label.as_ptr(),
-    );
+
+    append_item(menu, MF_STRING, ID_TOGGLE_ENABLED, toggle_text);
+    append_item(menu, MF_STRING, ID_HIDE_TRAY, "Hide tray");
+    append_item(menu, startup_flags, ID_TOGGLE_STARTUP, "Start on login");
     AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
-    AppendMenuW(menu, MF_STRING, ID_RELOAD, reload_label.as_ptr());
-    AppendMenuW(menu, MF_STRING, ID_OPEN_CONFIG, open_label.as_ptr());
-    AppendMenuW(
+    append_item(menu, MF_STRING, ID_RELOAD, "Reload app");
+    append_item(menu, MF_STRING, ID_OPEN_CONFIG, "Open replacements.json");
+    append_item(
         menu,
         MF_STRING,
         ID_OPEN_SETTINGS,
-        open_settings_label.as_ptr(),
+        "Open settings (config.json)",
     );
     AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
-    AppendMenuW(menu, MF_STRING, ID_ABOUT, about_label.as_ptr());
+    append_item(menu, MF_STRING, ID_ABOUT, "About");
     AppendMenuW(menu, MF_SEPARATOR, 0, null_mut());
-    AppendMenuW(menu, MF_STRING, ID_EXIT, exit_label.as_ptr());
+    append_item(menu, MF_STRING, ID_EXIT, "Exit");
 
     let mut pt: POINT = zeroed();
     GetCursorPos(&mut pt);
@@ -793,283 +722,184 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         hwnd,
         null_mut(),
     );
-    winapi::um::winuser::PostMessageW(hwnd, winapi::um::winuser::WM_NULL, 0, 0);
-    winapi::um::winuser::DestroyMenu(menu);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
 }
 
-/// Shows a native About dialog (a plain MessageBoxW). The link is included
-/// as plain, selectable/copyable text rather than a clickable control -
-/// simpler and guaranteed to render exactly like any other native Windows
-/// dialog, at the cost of not being a clickable link.
-fn show_about_window() {
+/// Builds the NOTIFYICONDATAW identifying our icon (no payload flags set).
+fn tray_data() -> Option<NOTIFYICONDATAW> {
+    let (hwnd, icon) = with_state(|s| (s.hwnd, s.tray_icon))?;
+    let mut nid: NOTIFYICONDATAW = unsafe { zeroed() };
+    nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd as HWND;
+    nid.uID = TRAY_ID;
+    nid.hIcon = icon as HICON;
+    Some(nid)
+}
+
+/// Asks the shell to show the icon. Safe to call when it is already there
+/// (NIM_ADD then fails harmlessly). Does not touch state or config.json.
+fn add_tray_icon() {
+    let Some(mut nid) = tray_data() else { return };
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    let tip = to_wide("Textpander (abbreviation replacement)");
+    let n = tip.len().min(nid.szTip.len());
+    nid.szTip[..n].copy_from_slice(&tip[..n]);
+    // The tooltip must stay NUL-terminated even when truncated.
+    nid.szTip[nid.szTip.len() - 1] = 0;
     unsafe {
-        let text = to_wide(&format!(
-            "Textpander {}\n\nMade by Alfakynz.\n\n{}",
-            env!("CARGO_PKG_VERSION"),
-            ABOUT_URL
-        ));
-        let title = to_wide("About Textpander");
-        winapi::um::winuser::MessageBoxW(
-            null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            winapi::um::winuser::MB_OK | winapi::um::winuser::MB_ICONINFORMATION,
-        );
+        Shell_NotifyIconW(NIM_ADD, &mut nid);
     }
 }
 
-/// Adds the tray icon back (idempotent: safe to call even if already shown).
+/// User-facing "show": adds the icon and remembers it as visible.
 fn show_tray_icon() {
-    let tray_guard = TRAY.lock().unwrap();
-    if let Some(tray) = tray_guard.as_ref() {
-        unsafe {
-            let mut nid: NOTIFYICONDATAW = zeroed();
-            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = tray.hwnd;
-            nid.uID = TRAY_ID;
-            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-            nid.uCallbackMessage = WM_TRAYICON;
-            nid.hIcon = tray.icon;
-            let tip = to_wide("Textpander (abbreviation replacement)");
-            let n = tip.len().min(nid.szTip.len());
-            nid.szTip[..n].copy_from_slice(&tip[..n]);
-            // NIM_ADD on an icon that's already present simply fails
-            // harmlessly, so this is safe to call unconditionally.
-            Shell_NotifyIconW(NIM_ADD, &mut nid);
-        }
-    }
-    drop(tray_guard);
-    if let Some(state) = STATE.lock().unwrap().as_mut() {
-        state.tray_visible = true;
-        persist_settings(state);
-    }
+    add_tray_icon();
+    with_state(|s| {
+        s.tray_visible = true;
+        persist_settings(s);
+    });
 }
 
-/// Watchdog: if the tray icon is supposed to be visible but the shell no
-/// longer knows about it (Explorer restarted, NIM_ADD raced with tray
-/// startup, ...), add it again. NIM_MODIFY fails when the icon is missing.
+/// Watchdog: NIM_MODIFY fails when the shell no longer knows our icon, in
+/// which case we add it back (Explorer restarted, NIM_ADD raced with tray
+/// startup...).
 fn ensure_tray_icon() {
-    let wanted = STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|s| s.tray_visible)
-        .unwrap_or(false);
-    if !wanted {
+    if !with_state(|s| s.tray_visible).unwrap_or(false) {
         return;
     }
-
-    let exists = {
-        let tray_guard = TRAY.lock().unwrap();
-        match tray_guard.as_ref() {
-            Some(tray) => unsafe {
-                let mut nid: NOTIFYICONDATAW = zeroed();
-                nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-                nid.hWnd = tray.hwnd;
-                nid.uID = TRAY_ID;
-                Shell_NotifyIconW(winapi::um::shellapi::NIM_MODIFY, &mut nid) != 0
-            },
-            None => return,
+    if let Some(mut nid) = tray_data() {
+        if unsafe { Shell_NotifyIconW(NIM_MODIFY, &mut nid) } == 0 {
+            add_tray_icon();
         }
-    };
-
-    if !exists {
-        show_tray_icon();
     }
 }
 
-/// Removes the tray icon's visual presence only - no state/settings
-/// changes. Used both by the user-facing hide_tray_icon() below and by
-/// run()'s shutdown cleanup (which must NOT persist "hidden" just because
-/// the process is exiting).
+/// Removes the icon's visual only (also used at shutdown, where we must NOT
+/// persist "hidden").
 fn remove_tray_icon_visual() {
-    let tray_guard = TRAY.lock().unwrap();
-    if let Some(tray) = tray_guard.as_ref() {
+    if let Some(mut nid) = tray_data() {
         unsafe {
-            let mut nid: NOTIFYICONDATAW = zeroed();
-            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = tray.hwnd;
-            nid.uID = TRAY_ID;
             Shell_NotifyIconW(NIM_DELETE, &mut nid);
         }
     }
 }
 
-/// Removes the tray icon in response to the user's "Hide tray" menu
-/// action. The app keeps running in the background (hook and
-/// replacements still active) - only the visible icon goes away. Can be
-/// brought back by relaunching the exe (see the single-instance /
-/// WAKE_MSG handling in run() and wndproc), which also persists it as
-/// visible again.
+/// "Hide tray": the app keeps running; relaunching the exe brings it back.
 fn hide_tray_icon() {
     remove_tray_icon_visual();
-    if let Some(state) = STATE.lock().unwrap().as_mut() {
-        state.tray_visible = false;
-        persist_settings(state);
-    }
+    with_state(|s| {
+        s.tray_visible = false;
+        persist_settings(s);
+    });
 }
 
+// ---------------------------------------------------------------------------
+// Menu actions
+// ---------------------------------------------------------------------------
+
 fn toggle_enabled() {
-    let mut guard = STATE.lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.enabled = !state.enabled;
-        // Don't carry over any in-progress word/undo state across the
-        // pause/resume boundary.
-        state.buffer.clear();
-        state.last_expansion = None;
-        state.suppress_expansion = false;
-        state.pending_word = None;
-        state.skip_next_char_resolution = false;
-        persist_settings(state);
-    }
+    with_state(|s| {
+        s.enabled = !s.enabled;
+        s.reset_typing();
+        persist_settings(s);
+    });
 }
 
 fn toggle_start_on_login() {
-    let mut guard = STATE.lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        state.start_on_login = !state.start_on_login;
-        set_start_on_login(state.start_on_login);
-        persist_settings(state);
+    if let Some(now) = with_state(|s| {
+        s.start_on_login = !s.start_on_login;
+        persist_settings(s);
+        s.start_on_login
+    }) {
+        set_start_on_login(now);
     }
 }
 
-/// Reloads both replacements.json and config.json from disk, and actually
-/// applies every setting from config.json (enabled, tray visibility,
-/// start-on-login) - not just the "characters" list. So if you hand-edit
-/// config.json while the app is running, this button picks up all of it,
-/// including flipping the tray icon or the login-startup registry entry to
-/// match what's now in the file.
+fn open_config_file(pick: impl FnOnce(&AppState) -> PathBuf) {
+    // Clone the path out first: ShellExecute must not run under the lock.
+    if let Some(path) = with_state(|s| pick(s)) {
+        open_in_default_app(&path);
+    }
+}
+
+/// Reloads replacements.json and config.json and applies every setting.
+/// On invalid JSON the previous configuration is kept.
 fn reload_config() {
-    let mut guard = STATE.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return,
+    // Files are read BEFORE taking the lock again: a parse error pops a
+    // message box whose nested message loop would run the keyboard hook,
+    // which locks STATE (see the note at the top of this file).
+    let Some((replacements_path, settings_path)) =
+        with_state(|s| (s.replacements_path.clone(), s.settings_path.clone()))
+    else {
+        return;
     };
+    let config = load_replacements(&replacements_path);
+    let settings = load_settings(&settings_path);
 
-    state.config = load_replacements(&state.replacements_path);
-
-    let settings = load_settings(&state.settings_path);
-    state.boundary_chars = boundary_chars_from_settings(&settings);
-    state.enabled = settings.enabled;
-    state.start_on_login = settings.start_on_login;
-
-    state.buffer.clear();
-    state.last_expansion = None;
-    state.suppress_expansion = false;
-    state.pending_word = None;
-    state.skip_next_char_resolution = false;
-
-    let want_tray_visible = settings.show_tray_icon;
-    let want_start_on_login = settings.start_on_login;
-
-    // Drop the lock before calling functions that take it themselves
-    // (show_tray_icon/hide_tray_icon), to avoid locking STATE twice.
-    drop(guard);
-
-    set_start_on_login(want_start_on_login);
-    if want_tray_visible {
-        show_tray_icon();
-    } else {
-        hide_tray_icon();
+    if let Err(e) = &config {
+        show_message(&format!("{e}\n\nThe previous abbreviations stay active."));
     }
-}
+    if let Err(e) = &settings {
+        show_message(&format!("{e}\n\nThe previous settings stay active."));
+    }
 
-fn open_replacements() {
-    let guard = STATE.lock().unwrap();
-    if let Some(state) = guard.as_ref() {
-        unsafe {
-            let op = to_wide("open");
-            let path = to_wide(state.replacements_path.to_string_lossy().as_ref());
-            ShellExecuteW(
-                null_mut(),
-                op.as_ptr(),
-                path.as_ptr(),
-                null_mut(),
-                null_mut(),
-                winapi::um::winuser::SW_SHOWNORMAL as i32,
-            );
+    with_state(|s| {
+        if let Ok(config) = config {
+            s.config = config;
+        }
+        if let Ok(settings) = &settings {
+            s.boundary_chars = boundary_chars_from_settings(settings);
+            s.enabled = settings.enabled;
+            s.start_on_login = settings.start_on_login;
+            s.clear_autocomplete = settings.clear_autocomplete;
+        }
+        s.reset_typing();
+    });
+
+    if let Ok(settings) = settings {
+        set_start_on_login(settings.start_on_login);
+        if settings.show_tray_icon {
+            show_tray_icon();
+        } else {
+            hide_tray_icon();
         }
     }
 }
 
-fn open_settings() {
-    let guard = STATE.lock().unwrap();
-    if let Some(state) = guard.as_ref() {
-        unsafe {
-            let op = to_wide("open");
-            let path = to_wide(state.settings_path.to_string_lossy().as_ref());
-            ShellExecuteW(
-                null_mut(),
-                op.as_ptr(),
-                path.as_ptr(),
-                null_mut(),
-                null_mut(),
-                winapi::um::winuser::SW_SHOWNORMAL as i32,
-            );
-        }
-    }
-}
-
-fn is_ctrl_down() -> bool {
-    unsafe { (GetAsyncKeyState(VK_CONTROL) as u16 & 0x8000) != 0 }
-}
-
-fn is_alt_down() -> bool {
-    unsafe { (GetAsyncKeyState(VK_MENU) as u16 & 0x8000) != 0 }
-}
-
-fn is_capslock_on() -> bool {
-    // The toggle bit is fine to read via GetKeyState (it's a global toggle,
-    // not tied to a specific thread's input queue).
-    unsafe { (GetKeyState(VK_CAPITAL) as u16 & 0x0001) != 0 }
-}
+// ---------------------------------------------------------------------------
+// Keyboard handling
+// ---------------------------------------------------------------------------
 
 /// Result of resolving what a keydown actually produces.
 enum KeyChar {
-    /// This key is a dead key (an accent waiting to combine with the next
-    /// letter, e.g. "^" then "e" -> "ê" on many layouts, or "~" then "n" ->
-    /// "ñ" via AltGr). See the comment on `skip_next_char_resolution` in
-    /// AppState for why the key *following* a dead key needs special
-    /// handling too.
+    /// A dead key (accent waiting to combine with the next letter).
     DeadKey,
-    /// A normal resolved character.
     Char(char),
-    /// Not a dead key, but no printable character came out of it either
-    /// (arrows, function keys, etc).
+    /// No printable character (arrows, function keys...).
     None,
 }
 
-/// Resolves the actual Unicode character a key produces, honoring the real
-/// keyboard layout of the focused window (Shift, CapsLock, AltGr - e.g. '@'
-/// on many European/AZERTY layouts is AltGr + a digit key). We build the
-/// key-state array ourselves from GetAsyncKeyState rather than calling
-/// GetKeyboardState, for the same reason described near is_ctrl_down: this
-/// hook's thread doesn't own the input queue, so thread-scoped state can be
-/// stale or simply never populated.
+/// Resolves the Unicode character a key produces, honoring the keyboard
+/// layout of the focused window (Shift, CapsLock, AltGr...). The key-state
+/// array is built from GetAsyncKeyState because this hook thread doesn't own
+/// the input queue, so GetKeyboardState can be stale.
 fn char_from_vk(vk: i32, scan_code: u32) -> KeyChar {
     unsafe {
-        let foreground = GetForegroundWindow();
-        let thread_id = GetWindowThreadProcessId(foreground, null_mut());
+        let thread_id = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
         let hkl = GetKeyboardLayout(thread_id);
 
-        // MapVirtualKeyExW is a stateless, pure table lookup - it never
-        // touches the OS's dead-key composition state - so it's a free,
-        // safe way to skip the ToUnicodeEx call below entirely for the
-        // common case. Its high bit tells us if this key is a dead key.
-        //
-        // Caveat: it only ever reports a key's *unshifted* base character,
-        // so it can't see a key that only becomes a dead key under AltGr
-        // (e.g. "~" typed as AltGr+2 on AZERTY). That's fine - the
-        // ToUnicodeEx call below still catches those correctly (it *does*
-        // see the real modifier state), we just don't get to skip calling
-        // it for that specific case.
-        let mapped = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_CHAR, hkl);
-        if mapped & 0x8000_0000 != 0 {
+        // MapVirtualKeyExW is a stateless table lookup: it never touches the
+        // OS dead-key composition state, so it is a free, safe pre-check.
+        // It can't see keys that are dead only under AltGr (e.g. "~" on
+        // AZERTY) - the ToUnicodeEx result below catches those.
+        if MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_CHAR, hkl) & 0x8000_0000 != 0 {
             return KeyChar::DeadKey;
         }
 
-        let mut keyboard_state = [0u8; 256];
-        for vk_code in [
+        let mut keys = [0u8; 256];
+        for modifier in [
             VK_SHIFT,
             VK_LSHIFT,
             VK_RSHIFT,
@@ -1080,68 +910,48 @@ fn char_from_vk(vk: i32, scan_code: u32) -> KeyChar {
             VK_LMENU,
             VK_RMENU,
         ] {
-            let pressed = (GetAsyncKeyState(vk_code) as u16 & 0x8000) != 0;
-            keyboard_state[vk_code as usize] = if pressed { 0x80 } else { 0 };
+            if is_down(modifier) {
+                keys[modifier as usize] = 0x80;
+            }
         }
-        keyboard_state[VK_CAPITAL as usize] = if is_capslock_on() { 1 } else { 0 };
+        if (GetKeyState(VK_CAPITAL) & 1) != 0 {
+            keys[VK_CAPITAL as usize] = 1;
+        }
 
-        let mut buf = [0u16; 8];
-        let result = ToUnicodeEx(
-            vk as u32,
-            scan_code,
-            keyboard_state.as_ptr(),
-            buf.as_mut_ptr(),
-            buf.len() as i32,
-            0,
-            hkl,
-        );
-
-        // A negative result means this key IS a dead key once the real
-        // modifier state (e.g. AltGr) is taken into account - this is how
-        // we catch the AltGr-only dead keys the pre-check above can't see.
-        if result < 0 {
-            // This ToUnicodeEx call above just armed the kernel-mode
-            // dead-key buffer as a side effect (documented by Microsoft:
-            // "it also changes the state of the kernel-mode keyboard
-            // buffer... it might also cause undesired side-effects if
-            // used in conjunction with TranslateMessage"). We don't
-            // swallow dead keys - the real keystroke still flows on to
-            // the focused app, which resolves it for real via its own
-            // TranslateMessage call. If we leave the buffer armed from
-            // our own probe, that downstream call sees a dead key
-            // already pending and immediately "consumes" it against
-            // itself, producing a doubled character (e.g. "~~") instead
-            // of waiting for the next letter to combine with it. Calling
-            // ToUnicodeEx again with the exact same parameters consumes
-            // our own bogus arm (result discarded), leaving the buffer
-            // empty so the real downstream processing arms it correctly
-            // on its own.
-            let mut flush_buf = [0u16; 8];
+        let translate = |out: &mut [u16; 8]| {
             ToUnicodeEx(
                 vk as u32,
                 scan_code,
-                keyboard_state.as_ptr(),
-                flush_buf.as_mut_ptr(),
-                flush_buf.len() as i32,
+                keys.as_ptr(),
+                out.as_mut_ptr(),
+                out.len() as i32,
                 0,
                 hkl,
-            );
+            )
+        };
+
+        let mut buf = [0u16; 8];
+        let result = translate(&mut buf);
+
+        if result < 0 {
+            // Dead key (once AltGr etc. is taken into account). Our probe
+            // just armed the kernel-mode dead-key buffer as a side effect;
+            // since we don't swallow dead keys, the focused app would then
+            // see a composition already pending and double the character
+            // ("~~"). Calling again with identical parameters consumes our
+            // own bogus arm so the app's real processing starts clean.
+            translate(&mut [0u16; 8]);
             return KeyChar::DeadKey;
         }
         if result == 0 {
             return KeyChar::None;
         }
-
-        match char::from_u32(buf[0] as u32) {
-            Some(ch) => KeyChar::Char(ch),
-            None => KeyChar::None,
-        }
+        char::from_u32(buf[0] as u32).map_or(KeyChar::None, KeyChar::Char)
     }
 }
 
-/// The set of virtual-key codes we deliberately ignore for the purposes of
-/// buffer tracking (modifier keys), because they routinely precede a letter
-/// key (e.g. Shift then a letter) and must not reset context.
+/// Modifier keys we ignore for buffer tracking: they routinely precede a
+/// letter (Shift + letter) and must not reset context.
 fn is_ignored_modifier(vk: i32) -> bool {
     matches!(
         vk,
@@ -1165,155 +975,134 @@ unsafe extern "system" fn keyboard_hook_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if ncode == HC_ACTION as i32 {
+    if ncode == HC_ACTION {
         let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
-        // Ignore events we generated ourselves via SendInput, to avoid
-        // feedback loops re-entering this same hook.
+        // Ignore events we injected ourselves, to avoid feedback loops.
         if kb.flags & LLKHF_INJECTED == 0 {
             let vk = kb.vkCode as i32;
-            let is_keydown = wparam as u32 == WM_KEYDOWN || wparam as u32 == WM_SYSKEYDOWN;
-            let is_keyup = wparam as u32 == WM_KEYUP || wparam as u32 == WM_SYSKEYUP;
-
-            if is_keydown {
-                if handle_keydown(vk, kb.scanCode) {
-                    // We handled this key ourselves (either replaced it with
-                    // an expansion, or undid one) - swallow the real event
-                    // so the app doesn't also receive the original keystroke.
-                    return 1;
-                }
-            } else if is_keyup {
-                if should_swallow_keyup(vk) {
-                    return 1;
-                }
+            let swallow = match wparam as u32 {
+                WM_KEYDOWN | WM_SYSKEYDOWN => handle_keydown(vk, kb.scanCode),
+                WM_KEYUP | WM_SYSKEYUP => should_swallow_keyup(vk),
+                _ => false,
+            };
+            if swallow {
+                return 1;
             }
         }
     }
     CallNextHookEx(null_mut(), ncode, wparam, lparam)
 }
 
-fn should_swallow_keyup(vk: i32) -> bool {
-    let mut guard = STATE.lock().unwrap();
-    if let Some(state) = guard.as_mut() {
-        if state.suppress_next_keyup == Some(vk) {
-            state.suppress_next_keyup = None;
-            return true;
-        }
+unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if ncode == HC_ACTION
+        && matches!(
+            wparam as u32,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN
+        )
+    {
+        // A click can put the caret anywhere (another field, another
+        // window): whatever was half-typed no longer applies.
+        with_state(|s| s.reset_typing());
     }
-    false
+    CallNextHookEx(null_mut(), ncode, wparam, lparam)
+}
+
+fn should_swallow_keyup(vk: i32) -> bool {
+    with_state(|s| {
+        let swallow = s.suppress_next_keyup == Some(vk);
+        if swallow {
+            s.suppress_next_keyup = None;
+        }
+        swallow
+    })
+    .unwrap_or(false)
+}
+
+/// A key that finished a word and triggers an expansion check: Enter/Tab
+/// (always active) or a character from the "characters" list in config.json.
+#[derive(Clone, Copy)]
+enum Boundary {
+    Key(i32),
+    Char(char),
 }
 
 /// Returns true if this keydown was fully handled by us and must be
 /// swallowed (not delivered to the focused app).
 fn handle_keydown(vk: i32, scan_code: u32) -> bool {
-    let mut guard = STATE.lock().unwrap();
-    let state = match guard.as_mut() {
-        Some(s) => s,
-        None => return false,
+    let mut guard = lock_state();
+    let Some(state) = guard.as_mut() else {
+        return false;
     };
 
-    if !state.enabled {
-        // Replacements paused via the tray menu: pass everything through
-        // untouched. (The buffer/undo state is already cleared by
-        // toggle_enabled when this was switched off.)
+    // Paused via the tray menu (state was already cleared when switching
+    // off), or a bare modifier: pass through untouched.
+    if !state.enabled || is_ignored_modifier(vk) {
         return false;
     }
 
-    if is_ignored_modifier(vk) {
-        return false;
+    // Focus moved to another window since the last key: the word in the
+    // buffer belongs to somewhere else.
+    let foreground = unsafe { GetForegroundWindow() } as usize;
+    if foreground != state.last_foreground {
+        state.reset_typing();
+        state.last_foreground = foreground;
     }
 
-    let ctrl = is_ctrl_down();
-    let alt = is_alt_down();
-    // A "pure" Ctrl-only or Alt-only chord is a real keyboard shortcut
-    // (Ctrl+Backspace = delete previous word, Alt+Backspace = Undo in many
-    // apps, Ctrl+C, etc.) and must never be intercepted or fed into our
-    // synthetic-backspace logic - injecting plain Backspace keystrokes while
-    // the real Ctrl is still held gets reinterpreted as Ctrl+Backspace by
-    // the target app, deleting far more than intended.
-    //
-    // AltGr (used to type '@' and other symbols on many layouts, and also
-    // several accent dead keys like `~` and `` ` ``) shows up here as
-    // Ctrl+Alt held *together*, which is deliberately let through to the
-    // character-handling code below - see char_from_vk / KeyChar::DeadKey
-    // for how dead keys reached via AltGr are still detected safely.
-    if (ctrl && !alt) || (alt && !ctrl) {
-        state.buffer.clear();
-        state.last_expansion = None;
-        state.suppress_expansion = false;
-        state.pending_word = None;
-        state.skip_next_char_resolution = false;
+    // A Ctrl-only or Alt-only chord is a real shortcut (Ctrl+Backspace,
+    // Ctrl+C...) and must never feed our synthetic-backspace logic. Ctrl+Alt
+    // together is AltGr (used for '@', '~'...) and is let through below.
+    if is_down(VK_CONTROL) != is_down(VK_MENU) {
+        state.reset_typing();
         return false;
     }
 
     if vk == VK_BACK {
-        // A Backspace cancels any pending dead-key composition, so the
-        // *next* key shouldn't be treated as "right after a dead key"
-        // anymore.
+        // Backspace cancels any pending dead-key composition.
         state.skip_next_char_resolution = false;
 
-        // Backspace pressed right after an expansion: undo it.
+        // Right after an expansion: undo it.
         if let Some(last) = state.last_expansion.take() {
-            state.buffer = last.typed.clone();
+            state.buffer.clone_from(&last.typed);
             state.suppress_expansion = true;
             state.suppress_next_keyup = Some(VK_BACK);
             drop(guard);
             perform_undo(&last);
             return true;
         }
-        // Backspace pressed right after a boundary key that did *not*
-        // trigger an expansion (e.g. "pld" + space, no match): this
-        // Backspace is deleting that boundary character on screen, so
-        // resume tracking from the word as it stood right before it,
-        // instead of starting over from an empty buffer. This is what
-        // makes "type pld, notice the typo, backspace twice, type s"
-        // still resolve to "pls" -> please.
-        if let Some(pending) = state.pending_word.take() {
-            state.buffer = pending;
-            return false;
+        // Right after a boundary key that matched nothing: this Backspace
+        // deletes that boundary, so resume tracking the word as it was.
+        match state.pending_word.take() {
+            Some(word) => state.buffer = word,
+            None => {
+                state.buffer.pop();
+            }
         }
-        state.buffer.pop();
         return false;
     }
 
-    // Any key other than Backspace closes the "undo window" and abandons
-    // any pending (unmatched) word - it's genuinely a new context now.
+    // Any other key closes the undo window and abandons the pending word.
     state.last_expansion = None;
     state.pending_word = None;
+    // One-shot: right after an undo, don't re-expand on the next boundary.
+    let skip_due_to_undo = mem::take(&mut state.suppress_expansion);
 
-    // One-shot: if this key comes right after an undo with no letters
-    // typed in between, don't re-expand on the next boundary. Reading this
-    // via mem::replace resets it for every key (not just boundary keys),
-    // matching the original behavior: typing any further letter closes the
-    // undo window just as much as reaching a boundary does.
-    let skip_due_to_undo = std::mem::replace(&mut state.suppress_expansion, false);
-
-    // Enter and Tab are always boundary keys, regardless of config.json.
-    // Anything else is a boundary only if the character it produces is in
-    // the user-configurable "characters" list (default: just space).
-    let boundary: Option<Boundary> = if vk == VK_RETURN || vk == VK_TAB {
+    let boundary = if vk == VK_RETURN || vk == VK_TAB {
         Some(Boundary::Key(vk))
-    } else if std::mem::replace(&mut state.skip_next_char_resolution, false) {
-        // The previous key was a dead key: this key must be left
-        // completely alone too (see the doc comment on
-        // skip_next_char_resolution), so the target app can finish
-        // composing the accent on its own without any interference from
-        // us, even indirect. Treat it like any other "no character" key.
+    } else if mem::take(&mut state.skip_next_char_resolution) {
+        // Previous key was a dead key: leave this one completely alone so
+        // the target app can finish composing the accent itself.
         state.buffer.clear();
         None
     } else {
         match char_from_vk(vk, scan_code) {
+            // A dead key alone produces no visible character, so it doesn't
+            // invalidate the word; just skip the next key's resolution.
             KeyChar::DeadKey => {
-                // Don't touch the buffer: a dead key alone hasn't produced
-                // any visible character yet, so it shouldn't invalidate an
-                // in-progress word. Remember to also skip the next key.
                 state.skip_next_char_resolution = true;
                 None
             }
             KeyChar::Char(ch) if state.boundary_chars.contains(&ch) => Some(Boundary::Char(ch)),
             KeyChar::Char(ch) => {
-                // Not a configured boundary character: just a regular
-                // character to add to the buffer (letters, digits, symbols
-                // that aren't in the "characters" list).
                 if state.buffer.len() < MAX_BUFFER_LEN {
                     state.buffer.push(ch);
                 } else {
@@ -1322,150 +1111,120 @@ fn handle_keydown(vk: i32, scan_code: u32) -> bool {
                 None
             }
             KeyChar::None => {
-                // Doesn't produce a character (arrows, function keys, etc.):
-                // breaks the word context.
                 state.buffer.clear();
                 None
             }
         }
     };
-
-    let boundary = match boundary {
-        Some(b) => b,
-        None => return false,
+    let Some(boundary) = boundary else {
+        return false;
     };
 
     if !skip_due_to_undo && !state.buffer.is_empty() {
         if let Some(expansion) = logic::expand(&state.config, &state.buffer) {
-            let typed = std::mem::take(&mut state.buffer);
+            let typed = mem::take(&mut state.buffer);
             let abbr_len = typed.chars().count();
             state.last_expansion = Some(LastExpansion {
                 typed,
-                expansion: expansion.clone(),
+                delete_len: expansion.chars().count() + 1, // +1: the boundary key
             });
             state.suppress_next_keyup = Some(vk);
+            let clear_autocomplete = state.clear_autocomplete;
             drop(guard);
-            perform_replacement(abbr_len, &expansion, boundary);
-            // We swallow the boundary key ourselves and re-type it as
-            // part of the replacement, so the caller must not let the
-            // original keystroke through too (that was the cause of
-            // the double-space bug).
+            // We swallow the boundary key and re-type it as part of the
+            // replacement, so the original keystroke must not pass through.
+            perform_replacement(abbr_len, &expansion, boundary, clear_autocomplete);
             return true;
         }
     }
-    // No match (or a one-shot-suppressed undo occurrence): remember
-    // this word for exactly one Backspace, in case the user steps
-    // back in to correct it.
-    state.pending_word = if state.buffer.is_empty() {
-        None
-    } else {
-        Some(std::mem::take(&mut state.buffer))
-    };
-    state.buffer.clear();
+
+    // No match: remember the word for exactly one Backspace.
+    let word = mem::take(&mut state.buffer);
+    state.pending_word = (!word.is_empty()).then_some(word);
     false
 }
 
-/// A key that finished a word and should trigger an expansion check: either
-/// a structural key (Enter/Tab, always active), or a specific character
-/// from the user-configurable "characters" list in config.json.
-#[derive(Clone, Copy)]
-enum Boundary {
-    Key(i32),
-    Char(char),
+// ---------------------------------------------------------------------------
+// Synthetic input
+// ---------------------------------------------------------------------------
+
+fn key_input(vk: u16, scan: u16, flags: u32) -> INPUT {
+    unsafe {
+        let mut input: INPUT = zeroed();
+        input.type_ = INPUT_KEYBOARD;
+        *input.u.ki_mut() = KEYBDINPUT {
+            wVk: vk,
+            wScan: scan,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        input
+    }
+}
+
+/// Key press + release of a virtual key.
+fn push_key(inputs: &mut Vec<INPUT>, vk: u16) {
+    inputs.push(key_input(vk, 0, 0));
+    inputs.push(key_input(vk, 0, KEYEVENTF_KEYUP));
+}
+
+/// Types text as Unicode, so accents etc. work on any keyboard layout.
+fn push_text(inputs: &mut Vec<INPUT>, text: &str) {
+    for unit in text.encode_utf16() {
+        inputs.push(key_input(0, unit, KEYEVENTF_UNICODE));
+        inputs.push(key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+    }
+}
+
+fn push_backspaces(inputs: &mut Vec<INPUT>, count: usize) {
+    for _ in 0..count {
+        push_key(inputs, VK_BACK as u16);
+    }
+}
+
+fn send_inputs(inputs: &mut [INPUT]) {
+    if !inputs.is_empty() {
+        unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_mut_ptr(),
+                size_of::<INPUT>() as i32,
+            );
+        }
+    }
 }
 
 /// Deletes the typed abbreviation, then types the expansion followed by the
-/// boundary key/character that triggered it. The real boundary keystroke is
-/// swallowed by the hook, so this is the only copy of it.
-fn perform_replacement(abbr_len: usize, expansion: &str, boundary: Boundary) {
-    let mut inputs: Vec<INPUT> = Vec::new();
-
-    for _ in 0..abbr_len {
-        push_vk_input(&mut inputs, VK_BACK as u16, false);
-        push_vk_input(&mut inputs, VK_BACK as u16, true);
+/// boundary key/character that triggered it.
+fn perform_replacement(
+    abbr_len: usize,
+    expansion: &str,
+    boundary: Boundary,
+    clear_autocomplete: bool,
+) {
+    let mut inputs = Vec::with_capacity((abbr_len + expansion.len() + 2) * 2);
+    // Typing over a selected inline-autocomplete suggestion replaces it, so
+    // whether or not one exists, the field now ends with "<abbr>~" and one
+    // extra Backspace removes exactly the marker. "~" is unlikely to match
+    // any suggestion, so it can't re-trigger autocompletion itself.
+    if clear_autocomplete {
+        push_text(&mut inputs, "~");
     }
-
-    // Type the expansion as Unicode, so accented characters work regardless
-    // of keyboard layout.
-    for unit in expansion.encode_utf16() {
-        push_unicode_input(&mut inputs, unit, false);
-        push_unicode_input(&mut inputs, unit, true);
-    }
-
+    push_backspaces(&mut inputs, abbr_len + usize::from(clear_autocomplete));
+    push_text(&mut inputs, expansion);
     match boundary {
-        Boundary::Key(vk) => {
-            push_vk_input(&mut inputs, vk as u16, false);
-            push_vk_input(&mut inputs, vk as u16, true);
-        }
-        Boundary::Char(ch) => {
-            let mut buf = [0u16; 2];
-            for unit in ch.encode_utf16(&mut buf).iter() {
-                push_unicode_input(&mut inputs, *unit, false);
-                push_unicode_input(&mut inputs, *unit, true);
-            }
-        }
+        Boundary::Key(vk) => push_key(&mut inputs, vk as u16),
+        Boundary::Char(ch) => push_text(&mut inputs, ch.encode_utf8(&mut [0; 4])),
     }
-
-    unsafe {
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_mut_ptr(),
-            size_of::<INPUT>() as i32,
-        );
-    }
+    send_inputs(&mut inputs);
 }
 
-/// Deletes the expansion text plus the boundary key that followed it, then
-/// retypes the original abbreviation exactly as the user typed it.
+/// Deletes the expansion plus its boundary key, then retypes the abbreviation
+/// exactly as the user typed it.
 fn perform_undo(last: &LastExpansion) {
-    let mut inputs: Vec<INPUT> = Vec::new();
-
-    let delete_count = last.expansion.encode_utf16().count() + 1; // +1 for the boundary char
-    for _ in 0..delete_count {
-        push_vk_input(&mut inputs, VK_BACK as u16, false);
-        push_vk_input(&mut inputs, VK_BACK as u16, true);
-    }
-
-    for unit in last.typed.encode_utf16() {
-        push_unicode_input(&mut inputs, unit, false);
-        push_unicode_input(&mut inputs, unit, true);
-    }
-
-    unsafe {
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_mut_ptr(),
-            size_of::<INPUT>() as i32,
-        );
-    }
-}
-
-fn push_vk_input(inputs: &mut Vec<INPUT>, vk: u16, key_up: bool) {
-    unsafe {
-        let mut input: INPUT = zeroed();
-        input.type_ = INPUT_KEYBOARD;
-        let mut ki: KEYBDINPUT = zeroed();
-        ki.wVk = vk;
-        ki.wScan = 0;
-        ki.dwFlags = if key_up { KEYEVENTF_KEYUP } else { 0 };
-        ki.time = 0;
-        ki.dwExtraInfo = 0;
-        *input.u.ki_mut() = ki;
-        inputs.push(input);
-    }
-}
-
-fn push_unicode_input(inputs: &mut Vec<INPUT>, code_unit: u16, key_up: bool) {
-    unsafe {
-        let mut input: INPUT = zeroed();
-        input.type_ = INPUT_KEYBOARD;
-        let mut ki: KEYBDINPUT = zeroed();
-        ki.wVk = 0;
-        ki.wScan = code_unit;
-        ki.dwFlags = KEYEVENTF_UNICODE | if key_up { KEYEVENTF_KEYUP } else { 0 };
-        ki.time = 0;
-        ki.dwExtraInfo = 0;
-        *input.u.ki_mut() = ki;
-        inputs.push(input);
-    }
+    let mut inputs = Vec::new();
+    push_backspaces(&mut inputs, last.delete_len);
+    push_text(&mut inputs, &last.typed);
+    send_inputs(&mut inputs);
 }

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseStyle {
     Lower,       // "pls"
     Capitalized, // "Pls"
@@ -13,24 +13,31 @@ pub enum CaseStyle {
 }
 
 /// Detects how a typed word is cased, based only on its letters.
+/// A single capital letter ("Q") counts as Capitalized, not Upper: it can't
+/// be told apart from "Q" the start of a word, and "Question" is the more
+/// useful expansion than "QUESTION".
 pub fn detect_case(word: &str) -> CaseStyle {
-    let letters: Vec<char> = word.chars().filter(|c| c.is_alphabetic()).collect();
-    if letters.is_empty() {
+    let mut letters = word.chars().filter(|c| c.is_alphabetic());
+    let Some(first) = letters.next() else {
         return CaseStyle::Mixed;
+    };
+    let (mut rest_upper, mut rest_lower, mut has_rest) = (true, true, false);
+    for c in letters {
+        has_rest = true;
+        rest_upper &= c.is_uppercase();
+        rest_lower &= c.is_lowercase();
     }
-    if letters.iter().all(|c| c.is_uppercase()) {
-        return CaseStyle::Upper;
+    if first.is_lowercase() && rest_lower {
+        CaseStyle::Lower
+    } else if first.is_uppercase() && !has_rest {
+        CaseStyle::Capitalized
+    } else if first.is_uppercase() && rest_upper {
+        CaseStyle::Upper
+    } else if first.is_uppercase() && rest_lower {
+        CaseStyle::Capitalized
+    } else {
+        CaseStyle::Mixed
     }
-    if letters.iter().all(|c| c.is_lowercase()) {
-        return CaseStyle::Lower;
-    }
-    let mut it = letters.iter();
-    if let Some(first) = it.next() {
-        if first.is_uppercase() && it.clone().all(|c| c.is_lowercase()) {
-            return CaseStyle::Capitalized;
-        }
-    }
-    CaseStyle::Mixed
 }
 
 fn capitalize_first(s: &str) -> String {
@@ -42,7 +49,7 @@ fn capitalize_first(s: &str) -> String {
 }
 
 /// Applies a detected case style to the canonical (lowercase) expansion text.
-pub fn apply_case(expansion: &str, style: &CaseStyle) -> String {
+pub fn apply_case(expansion: &str, style: CaseStyle) -> String {
     match style {
         CaseStyle::Upper => expansion.to_uppercase(),
         CaseStyle::Capitalized => capitalize_first(expansion),
@@ -65,7 +72,7 @@ pub fn load_config_map(json_text: &str) -> Result<HashMap<String, String>, serde
 pub fn expand(map: &HashMap<String, String>, typed_word: &str) -> Option<String> {
     let base = map.get(&typed_word.to_lowercase())?;
     let style = detect_case(typed_word);
-    Some(apply_case(base, &style))
+    Some(apply_case(base, style))
 }
 
 #[cfg(test)]
@@ -119,6 +126,24 @@ mod tests {
     fn multi_word_expansion_all_upper() {
         let m = sample_map();
         assert_eq!(expand(&m, "BTW"), Some("BY THE WAY".to_string()));
+    }
+
+    #[test]
+    fn single_capital_letter_is_capitalized_not_upper() {
+        let mut m = sample_map();
+        m.insert("q".to_string(), "question".to_string());
+        assert_eq!(expand(&m, "Q"), Some("Question".to_string()));
+        assert_eq!(expand(&m, "q"), Some("question".to_string()));
+    }
+
+    #[test]
+    fn detect_case_edge_cases() {
+        assert_eq!(detect_case("123"), CaseStyle::Mixed);
+        assert_eq!(detect_case("pLs"), CaseStyle::Mixed);
+        assert_eq!(detect_case("p1s"), CaseStyle::Lower);
+        assert_eq!(detect_case("P1S"), CaseStyle::Upper);
+        assert_eq!(detect_case("É"), CaseStyle::Capitalized);
+        assert_eq!(detect_case("ÉTÉ"), CaseStyle::Upper);
     }
 
     #[test]
